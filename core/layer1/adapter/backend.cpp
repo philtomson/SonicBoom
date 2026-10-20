@@ -21,7 +21,7 @@ namespace detail {
 
 c10::DispatchKey to_dispatch_key(BackendId backend,
                                  Functionality functionality) {
-  // v0: CPU + CUDA backends, so "highest-priority applicable backend wins" is
+  // v0: CPU + GPU backends, so "highest-priority applicable backend wins" is
   // trivially satisfied. The adapter maps (backend, functionality) onto the
   // native dispatch representation.
   switch (backend.value) {
@@ -37,7 +37,7 @@ c10::DispatchKey to_dispatch_key(BackendId backend,
           return c10::DispatchKey::Autograd;
       }
       break;
-    case 1: // BackendId::cuda()
+    case 1: // BackendId::gpu()
       switch (functionality) {
         case Functionality::Dense:
           return c10::DispatchKey::CUDA;

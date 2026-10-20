@@ -29,7 +29,7 @@
 #include <sonicboom/planner/resource.h>
 #include <sonicboom/planner/runtime_executor.h>
 #include <sonicboom/planner/sonic_backend.h>
-#include <sonicboom/planner/sonic_cuda_backend.h>
+#include "../planner/sonic_cuda_backend.h"
 #include <sonicboom/sx/exec.h>
 
 #include "../planner/autotune.h"  // B7 draft-length cost cache

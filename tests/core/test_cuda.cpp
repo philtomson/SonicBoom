@@ -61,9 +61,9 @@ int main() {
   Tensor a = empty({4}, ScalarType::Float);
   fill_float(a, {1.0f, 2.0f, 3.0f, 4.0f});
 
-  Tensor a_cuda = to_device(a, Device::cuda(0));
+  Tensor a_cuda = to_device(a, Device::gpu(0));
   assert(a_cuda.defined());
-  assert(a_cuda.device().type == DeviceType::CUDA);
+  assert(a_cuda.device().type == DeviceType::GPU);
   assert(a_cuda.device().index == 0);
   assert(a_cuda.sizes() == std::vector<int64_t>({4}));
 
@@ -75,7 +75,7 @@ int main() {
   // --- 2. Real CUDA kernel: aten::add.Tensor(self, other, alpha=1) --------
   Tensor b = empty({4}, ScalarType::Float);
   fill_float(b, {10.0f, 20.0f, 30.0f, 40.0f});
-  Tensor b_cuda = to_device(b, Device::cuda(0));
+  Tensor b_cuda = to_device(b, Device::gpu(0));
 
   OperatorHandle add = find_operator(OperatorName("aten::add", "Tensor"));
   assert(add.defined());
@@ -88,7 +88,7 @@ int main() {
   ResultList out = add.call(args);
   assert(out.size() == 1 && out[0].isTensor());
   Tensor c = out[0].toTensor();
-  assert(c.device().type == DeviceType::CUDA); // result stays on device
+  assert(c.device().type == DeviceType::GPU); // result stays on device
 
   Tensor c_cpu = to_device(c, Device::cpu());
   const auto* pc = static_cast<const float*>(c_cpu.data_ptr());
@@ -125,9 +125,9 @@ int main() {
     assert(cudnn.defined());
 
     Tensor self4 = empty({1, 1, 2, 2}, ScalarType::Float);
-    Tensor self4_cuda = to_device(self4, Device::cuda(0));
+    Tensor self4_cuda = to_device(self4, Device::gpu(0));
     Tensor w4 = empty({1, 1, 2, 2}, ScalarType::Float);
-    Tensor w4_cuda = to_device(w4, Device::cuda(0));
+    Tensor w4_cuda = to_device(w4, Device::gpu(0));
 
     ArgumentList cargs;
     cargs.push_back(Value(self4_cuda));                      // self

@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-#include <sonicboom/planner/sonic_cuda_backend.h>
+#include "sonic_cuda_backend.h"
 
 #include <sonicboom/compiler/GlueCodegen.h>
 #include <sonicboom/model/exec.h>

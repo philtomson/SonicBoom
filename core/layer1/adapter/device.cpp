@@ -23,8 +23,11 @@ c10::Device to_aten(const Device& d) {
   switch (d.type) {
     case DeviceType::CPU:
       return c10::Device(c10::DeviceType::CPU, static_cast<int8_t>(d.index));
-    case DeviceType::CUDA:
-      // c10::DeviceIndex is int8_t; the CUDA device ordinal is 0 for v0.
+    case DeviceType::GPU:
+      // c10::DeviceIndex is int8_t; the accelerator ordinal is 0 for v0. The
+      // nt side is vendor-neutral, so it is this adapter that names the native
+      // GPU device type — CUDA on this build; a ROCm build maps its `GPU` onto
+      // the HIP device type here.
       return c10::Device(c10::DeviceType::CUDA, static_cast<int8_t>(d.index));
   }
   TORCH_CHECK(false, "unsupported nt::DeviceType");
@@ -38,9 +41,9 @@ Device from_aten(const c10::Device& d) {
       // single-device, so normalize to index 0 (matching Device::cpu()).
       return Device{DeviceType::CPU, 0};
     case c10::DeviceType::CUDA:
-      // Preserve the CUDA device ordinal (-1 means "current device" in c10;
+      // Preserve the accelerator ordinal (-1 means "current device" in c10;
       // v0 uses the explicit index, normalizing -1 to 0).
-      return Device{DeviceType::CUDA,
+      return Device{DeviceType::GPU,
                     d.index() < 0 ? 0 : static_cast<int32_t>(d.index())};
   }
   TORCH_CHECK(false, "unsupported c10::DeviceType");

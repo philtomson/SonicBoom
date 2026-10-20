@@ -1,8 +1,10 @@
 # ROCm / Strix Halo Porting Plan
 
-Status: **active** — Phase 0-2 complete (branch `amd_dev`), Phase 4 started
-(vendor-neutral device gate landed), Phase 3 started (generated decode
-attention runs on AMD; prefill attention and the dense GEMM are open).
+Status: **active** — Phase 0-2 complete (branch `amd_dev`), Phase 4 under way
+(vendor-neutral device gate + vendor-neutral device/backend IDs landed; the
+per-op and device-resident forward paths run on AMD), Phase 3 started
+(generated decode attention runs on AMD; prefill attention and the dense GEMM
+are open).
 `origin/master` merged in
 (bb8e43f): upstream's training/backward work is CUDA-gated in its host files,
 so the ROCm build takes it as host-only code; two conflicts (NVTX include,
@@ -37,12 +39,17 @@ Target GPU: **AMD Radeon 8060S** (Strix Halo iGPU), **gfx1151** (RDNA 3.5,
    `core/src/nn/cuda_stream.h`, `core/src/nn/cuda_graph.h` — raw
    `cuda_runtime.h` alloc/memcpy/streams/graph-capture.
 4. **Layer-2 public API** hard-codes CUDA:
-   - `core/include/sonicboom/device.h` — `DeviceType::CUDA`, `Device::cuda()`
-   - `core/include/sonicboom/backend.h` — `BackendId::cuda()`
-   - `core/include/sonicboom/tensor.h` — `cuda_available()`
+   - `core/include/sonicboom/device.h` — `DeviceType::GPU`, `Device::gpu()`
+     (renamed from `CUDA` / `cuda()`; the nt enum is now vendor-neutral)
+   - `core/include/sonicboom/backend.h` — `BackendId::gpu()` (same rename)
+   - `core/include/sonicboom/tensor.h` — `cuda_available()` stays (vendor
+     query, paired with the neutral `gpu_available()`)
    - `core/include/sonicboom/quant/quantized_matmul_cuda.h` — `quant::cuda`
-   - `core/include/sonicboom/planner/sonic_cuda_backend.h` — `SonicCudaBackend`
+     (vendor-specific kernel namespace, paired with `quant::gpu_available()`)
+   - `core/src/planner/sonic_cuda_backend.h` — `SonicCudaBackend` (moved out
+     of the public include tree; it was never a Layer-2 surface)
    - `core/layer1/adapter/{device,backend,tensor}.cpp` — `DispatchKey::CUDA`
+     (still the native mapping for the GPU backend on this build)
    - `core/CMakeLists.txt` CUDA block; `CMakeLists.txt`
      `SONICBOOM_USE_CUDA`; `CMAKE_CUDA_ARCHITECTURES=86`
 5. **Build tooling:** `tools/mlir/build-mlir.sh` builds LLVM targets
@@ -260,8 +267,15 @@ skips when no AMD device is present).
       item. `test_generate.cpp:171` / `:269` also stay gated until then: they
       go through `generate()`, so on ROCm they would exercise the CPU spine and
       label it "Cuda" (`:171`) or hit the stub (`:269`).
-- [ ] Vendor-neutral IDs: `DeviceType::GPU`, `BackendId::gpu()`, `quant::gpu`;
-      move `sonic_cuda_backend.h` behind boundary.
+- [x] **Vendor-neutral IDs.** `DeviceType::GPU` + `Device::gpu()` (was
+      `DeviceType::CUDA` / `Device::cuda()`), `BackendId::gpu()` (was
+      `cuda()`), and `SonicCudaBackend`'s header moved from
+      `core/include/sonicboom/planner/` to `core/src/planner/` — it is a
+      backend implementation detail and never was Layer-2 surface. The adapter
+      keeps naming the native GPU device type / dispatch keys: Layer 1 decides
+      what "GPU" means, and on this build that is still CUDA. `quant::cuda`
+      stays as the vendor-specific kernel namespace, paired with the neutral
+      `quant::gpu_available()`.
 - [ ] Relax byte-identity attention/GEMM asserts (wave/expf differences) —
       applies once those regions exist for AMD (Phase 3).
 

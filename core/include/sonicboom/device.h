@@ -20,20 +20,21 @@
 
 namespace nt {
 
-// CPU and CUDA. ROCm / other accelerators are deferred manifest amendments and
-// must not appear here.
+// CPU and GPU. The accelerator enumerator is deliberately vendor-neutral: which
+// implementation it denotes is the Layer 1 adapter's business (CUDA on a CUDA
+// build, HIP on a ROCm build), and no accelerator-specific name belongs here.
 enum class DeviceType : uint8_t {
   CPU,
-  CUDA,
+  GPU,
 };
 
 struct Device {
   DeviceType type = DeviceType::CPU;
-  int32_t index = 0; // device ordinal; 0 for CPU, the CUDA device index for CUDA.
+  int32_t index = 0; // device ordinal; 0 for CPU, the accelerator index for GPU.
 
   static constexpr Device cpu() { return Device{DeviceType::CPU, 0}; }
-  static constexpr Device cuda(int32_t index = 0) {
-    return Device{DeviceType::CUDA, index};
+  static constexpr Device gpu(int32_t index = 0) {
+    return Device{DeviceType::GPU, index};
   }
 };
 
