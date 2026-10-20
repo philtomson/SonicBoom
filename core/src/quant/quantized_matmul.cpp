@@ -23,7 +23,9 @@
 #include "ggml_derived/legacy_quants_q5_0_q8_0.h"
 #include "ggml_derived/vec_dot_qK_q8K.h"
 
-#ifdef SONICBOOM_USE_CUDA
+#if defined(SONICBOOM_USE_CUDA) || defined(SONICBOOM_USE_ROCM)
+// On a ROCm build this header's entry points are the HIP twins (same namespace,
+// same contract); the runtime that backs them lives in hip_quant_matmul.hip.
 #include <sonicboom/quant/quantized_matmul_cuda.h>
 #endif
 
@@ -547,6 +549,16 @@ bool cuda_available() {
 #endif
 }
 
+bool gpu_available() {
+#if defined(SONICBOOM_USE_CUDA) || defined(SONICBOOM_USE_ROCM)
+  // cuda::available() is the device query of whichever backend this build has:
+  // the CUDA runtime on a CUDA build, the HIP runtime on a ROCm build.
+  return cuda::available();
+#else
+  return false;
+#endif
+}
+
 bool matvec(const QuantizedTensor& W, std::span<const float> x,
             std::span<float> y, MatmulBackend backend) {
   switch (backend) {
@@ -555,8 +567,8 @@ bool matvec(const QuantizedTensor& W, std::span<const float> x,
     case MatmulBackend::CpuF32:
       return matvec_f32(W, x, y);
     case MatmulBackend::Cuda:
-#ifdef SONICBOOM_USE_CUDA
-      if (cuda::available()) return cuda::matvec_f32(W, x, y);
+#if defined(SONICBOOM_USE_CUDA) || defined(SONICBOOM_USE_ROCM)
+      if (gpu_available()) return cuda::matvec_f32(W, x, y);
 #endif
       return matvec_f32(W, x, y);
   }
@@ -571,8 +583,8 @@ bool matmul(const QuantizedTensor& W, std::span<const float> X,
     case MatmulBackend::CpuF32:
       return matmul_f32(W, X, Y, n);
     case MatmulBackend::Cuda:
-#ifdef SONICBOOM_USE_CUDA
-      if (cuda::available()) return cuda::matmul_f32(W, X, Y, n);
+#if defined(SONICBOOM_USE_CUDA) || defined(SONICBOOM_USE_ROCM)
+      if (gpu_available()) return cuda::matmul_f32(W, X, Y, n);
 #endif
       return matmul_f32(W, X, Y, n);
   }

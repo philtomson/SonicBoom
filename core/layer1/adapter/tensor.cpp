@@ -89,6 +89,8 @@ bool hip_available() {
 #endif
 }
 
+bool gpu_available() { return cuda_available() || hip_available(); }
+
 } // namespace nt
 
 namespace nt {

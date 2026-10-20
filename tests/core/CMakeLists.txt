@@ -225,9 +225,15 @@ if(SONICBOOM_USE_CUDA OR SONICBOOM_USE_ROCM)
   target_link_libraries(test_cuda_elementwise PRIVATE sonicboom)
   sb_add_cpp_test(test_cuda_elementwise)
 
+  # Vendor-neutral device gate (quant::/nt::gpu_available()) and the dispatcher
+  # it gates (MatmulBackend::Cuda matvec/matmul vs the CPU f32 reference).
+  add_executable(test_gpu_gate test_gpu_gate.cpp)
+  target_link_libraries(test_gpu_gate PRIVATE sonicboom)
+  sb_add_cpp_test(test_gpu_gate)
+
   # Small, but still GPU tests: they run one at a time on the GPU.
   set_tests_properties(test_cuda test_cuda_quant test_cuda_gather
-                       test_cuda_elementwise
+                       test_cuda_elementwise test_gpu_gate
     PROPERTIES RESOURCE_LOCK gpu_vram)
 endif()
 

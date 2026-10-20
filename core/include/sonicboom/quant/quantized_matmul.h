@@ -34,37 +34,49 @@
 namespace sonicboom::quant {
 
 // Which matmul backend the quantized matvec/matmul dispatches to. The model
-// execution layer picks one backend per forward pass; the Cuda backend is
-// available only when the build is configured with SONICBOOM_USE_CUDA=ON and a
-// device is present (it falls back to the f32 CPU reference otherwise, so its
-// numerical semantics stay f32-dequant regardless of device).
+// execution layer picks one backend per forward pass. `Cuda` means "the GPU
+// backend this build selected" — CUDA or ROCm/HIP, one per tree (there is never
+// a choice at runtime); it is available only when such a backend is configured
+// and a device is present (see gpu_available()), and falls back to the f32 CPU
+// reference otherwise, so its numerical semantics stay f32-dequant regardless
+// of device.
 enum class MatmulBackend : uint8_t {
   CpuQ8K,  // llama.cpp-equivalent q8_K activation (bit-exact oracle reference)
   CpuF32,  // f32 activation, scalar reference
   Cuda,    // dequantize-on-the-fly gemv on device (f32-activation semantics)
 };
 
-// Whether the Cuda backend is actually backed by a present CUDA device. False
-// when the build has no CUDA support (SONICBOOM_USE_CUDA off) or no device is
-// present, in which case matvec/matmul with MatmulBackend::Cuda silently fall
-// back to the f32 CPU reference. Callers use this to distinguish "ran on the
-// device" from "fell back to CPU" (e.g. for honest timing). No CUDA types are
-// exposed; this is a pure runtime query.
+// Whether the Cuda backend is actually backed by a present device.
+// CUDA-specific: false on a ROCm build even when an AMD device is present (use
+// gpu_available() for the vendor-neutral question). False when the build has no CUDA support
+// (SONICBOOM_USE_CUDA off) or no device is present, in which case matvec/matmul
+// with MatmulBackend::Cuda silently fall back to the f32 CPU reference. Callers
+// use this to distinguish "ran on the device" from "fell back to CPU" (e.g. for
+// honest timing). No CUDA types are exposed; this is a pure runtime query.
 bool cuda_available();
+
+// Vendor-neutral device gate: true when this build has a GPU backend (CUDA or
+// ROCm/HIP) and a device of it is present. This is the query a caller that
+// merely wants "is there a device to run this on" should use, so it does not
+// have to know which backend the build selected; cuda_available() stays the
+// CUDA-specific answer (false on a ROCm build). The two agree on a CUDA build,
+// and this is false for a CPU-only build. No device types are exposed.
+bool gpu_available();
 
 // Backend-dispatching matvec: y = W @ x through the requested backend. This is
 // the single seam the model execution layer calls for quantized matmuls; it
 // keeps the per-backend reference kernels (matvec_f32 / matvec_f32_q8_K above,
 // and cuda::matvec_f32) as the only implementations. Cuda routes to
-// cuda::matvec_f32 and falls back to the f32 CPU reference when CUDA is
-// unavailable. Same shape/size contracts and failure semantics as the
+// cuda::matvec_f32 (the active backend's device gemv — the HIP twin on a ROCm
+// build) and falls back to the f32 CPU reference when no device is present
+// (see gpu_available()). Same shape/size contracts and failure semantics as the
 // reference kernels.
 bool matvec(const QuantizedTensor& W, std::span<const float> x,
             std::span<float> y, MatmulBackend backend);
 
 // Backend-dispatching batched matmul: Y = W @ X ([cols, n] activation). Cuda
 // routes to cuda::matmul_f32 (per-column gemv) and falls back to the f32 CPU
-// reference when CUDA is unavailable. Same contracts as matmul_f32 /
+// reference when no device is present. Same contracts as matmul_f32 /
 // matmul_f32_q8_K.
 bool matmul(const QuantizedTensor& W, std::span<const float> X,
             std::span<float> Y, uint64_t n, MatmulBackend backend);

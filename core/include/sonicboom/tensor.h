@@ -83,4 +83,9 @@ bool cuda_available();
 // True when this build is ROCm/HIP-enabled AND an AMD GPU is present at runtime.
 bool hip_available();
 
+// True when a GPU device of either backend is present (cuda_available() ||
+// hip_available()). Vendor-neutral companion to the two above, for callers that
+// only care that a device exists.
+bool gpu_available();
+
 } // namespace nt
