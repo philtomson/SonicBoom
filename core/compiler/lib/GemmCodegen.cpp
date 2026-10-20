@@ -35,6 +35,7 @@
 #include <llvm/Config/llvm-config.h>
 
 #include <map>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -42,6 +43,15 @@
 
 namespace sonicboom::compiler {
 namespace {
+
+// The AMDGPU body's fixed block (see gemm_region_text_amd): the scalar kernel
+// derives its per-thread register tile from this, so the launcher and the
+// emitter must agree on it.
+constexpr int kAmdDenseGemmThreads = 256;
+
+// gfx11 gives a workgroup 64 KiB of LDS; the AMD body stages one slab per K
+// step and rejects shapes whose slab does not fit.
+constexpr int kAmdDenseGemmLdsBytes = 64 * 1024;
 
 struct Emitter {
   std::string body;
@@ -373,28 +383,314 @@ std::string gemm_region_text(const DenseGemmShape &sh, int sm_arch) {
   return text;
 }
 
+// AMDGPU body. The tensor-core text above is NVVM-only (nvgpu ldmatrix/mma,
+// cp.async), so this keeps the same kernel ABI and the same output contract
+// with tensor-neutral ops: one BK slab of W and X per K step is cooperatively
+// staged in shared memory (scalar loads, zero fill out of range), then every
+// thread accumulates its 4 x (outputs/thread/4) register tile out of that slab
+// with 8-wide bf16 vector loads, an extf to f32 and `vector.reduction <add>`.
+// Single-buffered: two barriers per step, no async copies.
+//
+// Thread map: 256 threads, `tpr` thread tiles across the token axis, so a warp
+// reads one W row per 4-row group and `tpr`-wide X rows from LDS.
+std::string gemm_region_text_amd(const DenseGemmShape &sh, int gfx_arch) {
+  const int BM = sh.bm;
+  const int BN = sh.bn;
+  const int BK = sh.bk;
+  constexpr int kPad = 8;  // elements; pads a row to a 16-byte boundary
+  const int BKW = BK + kPad;
+  const int OUT = BM * BN / kAmdDenseGemmThreads;  // accumulators per thread
+  constexpr int BRT = 4;                           // output rows per thread
+  const int BTT = OUT / BRT;                       // output tokens per thread
+  const int TPR = BN / BTT;                        // thread tiles across tokens
+  const int StagedA = BM * BK;                     // elements per slab
+  const int StagedB = BN * BK;
+  const int BStage = BM * BKW * 2;                 // bytes; B starts after A
+  const std::string SmemTy = "#gpu.address_space<workgroup>";
+
+  Emitter e;
+  std::map<std::string, std::string> C;
+  const auto s = [](int v) { return std::to_string(v); };
+  const auto c32 = [&](const char *n, int v) {
+    C[n] = e.val("arith.constant " + s(v) + " : i32");
+  };
+  const auto c64 = [&](const char *n, int v) {
+    C[n] = e.val("arith.constant " + s(v) + " : i64");
+  };
+  const auto cf = [&](const char *n, const char *v) {
+    C[n] = e.val(std::string("arith.constant ") + v + " : f32");
+  };
+  const auto ci = [&](const char *n, int v) {
+    C[n] = e.val("arith.constant " + s(v) + " : index");
+  };
+
+  const std::string FUNC =
+      "gpu.func @gemm(%x: memref<?x?xbf16>, %w: memref<?x?xbf16>, "
+      "%y: !llvm.ptr, %m: i32, %k: i32, %n: i32, %alpha: f32) kernel {";
+
+  c32("c0", 0); c32("c1", 1); c32("c2", 2); c32("c8", 8);
+  c32("cbm", BM); c32("cbn", BN);
+  c64("l0", 0); c64("l1", 1);
+  ci("i0", 0); ci("i1", 1); ci("i8", 8);
+  ci("ith", kAmdDenseGemmThreads);
+  ci("ibk", BK);
+  ci("ibsoff", BStage);
+  ci("icha", StagedA);
+  ci("ichb", StagedB);
+  ci("itpr", TPR);
+  ci("ibr", BRT);
+  ci("ibtt", BTT);
+  cf("cf0", "0.0");
+
+  const std::string tid = e.val("gpu.thread_id x");
+  const std::string bx = e.val("gpu.block_id x");
+  const std::string by = e.val("gpu.block_id y");
+  const std::string smem =
+      e.val("gpu.dynamic_shared_memory : memref<?xi8, " + SmemTy + ">");
+  const std::string asm_ =
+      e.val("memref.view " + smem + "[" + C["i0"] +
+            "][] : memref<?xi8, " + SmemTy + "> to memref<" + s(BM) + "x" +
+            s(BKW) + "xbf16, " + SmemTy + ">");
+  const std::string bsm =
+      e.val("memref.view " + smem + "[" + C["ibsoff"] +
+            "][] : memref<?xi8, " + SmemTy + "> to memref<" + s(BN) + "x" +
+            s(BKW) + "xbf16, " + SmemTy + ">");
+  // Readers view the same slabs as 8-wide bf16 vectors: `vector.load` from a
+  // workgroup memref is not converted by the ROCDL pipeline (it needs the
+  // workgroup memory-space mapping that only the GPU conversion registers),
+  // while `memref.load` of a vector element type is.
+  const std::string asmv =
+      e.val("memref.view " + smem + "[" + C["i0"] +
+            "][] : memref<?xi8, " + SmemTy + "> to memref<" + s(BM) + "x" +
+            s(BKW / 8) + "xvector<8xbf16>, " + SmemTy + ">");
+  const std::string bsmv =
+      e.val("memref.view " + smem + "[" + C["ibsoff"] +
+            "][] : memref<?xi8, " + SmemTy + "> to memref<" + s(BN) + "x" +
+            s(BKW / 8) + "xvector<8xbf16>, " + SmemTy + ">");
+  const std::string bxi = e.val("arith.index_cast " + bx + " : index to i32");
+  const std::string byi = e.val("arith.index_cast " + by + " : index to i32");
+  const std::string n0 = e.val("arith.muli " + bxi + ", " + C["cbn"] +
+                               " : i32");
+  const std::string m0 = e.val("arith.muli " + byi + ", " + C["cbm"] +
+                               " : i32");
+  const std::string kidx = e.val("arith.index_cast %k : i32 to index");
+  const std::string ktmax =
+      e.val("arith.ceildivui " + kidx + ", " + C["ibk"] + " : index");
+
+  // Tile origins: thread -> (row group, token group), block -> (m0, n0).
+  const std::string rowtile =
+      e.val("arith.divui " + tid + ", " + C["itpr"] + " : index");
+  const std::string toktile =
+      e.val("arith.remui " + tid + ", " + C["itpr"] + " : index");
+  const std::string row0 =
+      e.val("arith.muli " + rowtile + ", " + C["ibr"] + " : index");
+  const std::string tok0 =
+      e.val("arith.muli " + toktile + ", " + C["ibtt"] + " : index");
+
+  // One slab: each thread stages a strided subset of the elements, loading W or
+  // X at (row, col) and zero-filling outside the runtime bounds.
+  const auto stage = [&](const char *src, const std::string &dst,
+                         const std::string &base, const char *bound,
+                         const char *chunks, int nrows, const char *tag) {
+    const std::string it = "%ci_" + std::string(tag);
+    e.op("scf.for " + it + " = " + tid + " to " + C[chunks] + " step " +
+         C["ith"] + " : index {");
+    const std::string row =
+        e.val("arith.divui " + it + ", " + C["ibk"] + " : index");
+    const std::string col =
+        e.val("arith.remui " + it + ", " + C["ibk"] + " : index");
+    const std::string row32 =
+        e.val("arith.index_cast " + row + " : index to i32");
+    const std::string grow =
+        e.val("arith.addi " + base + ", " + row32 + " : i32");
+    const std::string ktcol =
+        e.val("arith.muli %kt, " + C["ibk"] + " : index");
+    const std::string gcol =
+        e.val("arith.addi " + ktcol + ", " + col + " : index");
+    const std::string rok =
+        e.val("arith.cmpi slt, " + grow + ", " + bound + " : i32");
+    const std::string cok =
+        e.val("arith.cmpi slt, " + gcol + ", " + kidx + " : index");
+    const std::string ok = e.val("arith.andi " + rok + ", " + cok + " : i1");
+    const std::string got = e.val("scf.if " + ok + " -> bf16 {");
+    {
+      const std::string gr =
+          e.val("arith.index_cast " + grow + " : i32 to index");
+      const std::string v =
+          e.val(std::string("memref.load %") + src + "[" + gr + ", " + gcol +
+                "] : memref<?x?xbf16>");
+      e.op("scf.yield " + v + " : bf16");
+    }
+    e.op("} else {");
+    {
+      const std::string z = e.val("arith.constant 0.0 : bf16");
+      e.op("scf.yield " + z + " : bf16");
+    }
+    e.op("}");
+    e.op("memref.store " + got + ", " + dst + "[" + row + ", " + col +
+         "] : memref<" + s(nrows) + "x" + s(BKW) + "xbf16, " + SmemTy + ">");
+    e.op("}");
+  };
+
+  std::vector<std::string> names;
+  for (int i = 0; i < OUT; ++i) names.push_back("%o" + s(i));
+  std::string ia = "iter_args(", ty = " -> (", res;
+  for (int i = 0; i < OUT; ++i) {
+    ia += (i ? ", " : "") + names[i] + " = " + C["cf0"];
+    ty += (i ? ", " : "") + std::string("f32");
+    res += (i ? ", " : "") + std::string("%g") + s(i);
+  }
+  ia += ")";
+  ty += ")";
+  e.op(res + " = scf.for %kt = " + C["i0"] + " to " + ktmax + " step " +
+       C["i1"] + " " + ia + ty + " {");
+  {
+    // The slab is single-buffered: the leading barrier waits for the previous
+    // step's readers, the trailing one publishes the new stage.
+    e.op("gpu.barrier");
+    stage("w", asm_, m0, "%m", "icha", BM, "a");
+    stage("x", bsm, n0, "%n", "ichb", BN, "b");
+    e.op("gpu.barrier");
+
+    std::vector<std::string> cur = names;
+    for (int kk = 0; kk < BK; kk += 8) {
+      const std::string kkc =
+          e.val("arith.constant " + s(kk / 8) + " : index");
+      for (int r = 0; r < BRT; ++r) {
+        const std::string ar =
+            r == 0 ? row0
+                   : e.val("arith.addi " + row0 + ", " +
+                           e.val("arith.constant " + s(r) + " : index") +
+                           " : index");
+        const std::string av = e.val(
+            "memref.load " + asmv + "[" + ar + ", " + kkc +
+            "] : memref<" + s(BM) + "x" + s(BKW / 8) + "xvector<8xbf16>, " +
+            SmemTy + ">");
+        const std::string af = e.val("arith.extf " + av +
+                                     " : vector<8xbf16> to vector<8xf32>");
+        for (int t = 0; t < BTT; ++t) {
+          const std::string bt =
+              t == 0 ? tok0
+                     : e.val("arith.addi " + tok0 + ", " +
+                             e.val("arith.constant " + s(t) + " : index") +
+                             " : index");
+          const std::string bv = e.val(
+              "memref.load " + bsmv + "[" + bt + ", " + kkc +
+              "] : memref<" + s(BN) + "x" + s(BKW / 8) + "xvector<8xbf16>, " +
+              SmemTy + ">");
+          const std::string bf = e.val("arith.extf " + bv +
+                                       " : vector<8xbf16> to vector<8xf32>");
+          const std::string pr = e.val("arith.mulf " + af + ", " + bf +
+                                       " : vector<8xf32>");
+          const std::string d = e.val("vector.reduction <add>, " + pr +
+                                      " : vector<8xf32> into f32");
+          const int idx = r * BTT + t;
+          cur[idx] = e.val("arith.addf " + cur[idx] + ", " + d + " : f32");
+        }
+      }
+    }
+    std::string yields, ytypes;
+    for (int i = 0; i < OUT; ++i) {
+      yields += (i ? ", " : "") + cur[i];
+      ytypes += (i ? ", " : "") + std::string("f32");
+    }
+    e.op("scf.yield " + yields + " : " + ytypes);
+  }
+  e.op("}");
+
+  // ---- store: Y[token][row] (token-major), f32 ----
+  const std::string m64 = e.val("arith.extsi %m : i32 to i64");
+  const std::string row0i = e.val("arith.index_cast " + row0 + " : index to i32");
+  const std::string tok0i = e.val("arith.index_cast " + tok0 + " : index to i32");
+  const std::string mrow0 = e.val("arith.addi " + m0 + ", " + row0i + " : i32");
+  const std::string mtok0 = e.val("arith.addi " + n0 + ", " + tok0i + " : i32");
+  for (int r = 0; r < BRT; ++r) {
+    const std::string gmrow =
+        r == 0 ? mrow0
+               : e.val("arith.addi " + mrow0 + ", " +
+                       e.val("arith.constant " + s(r) + " : i32") + " : i32");
+    const std::string mok =
+        e.val("arith.cmpi slt, " + gmrow + ", %m : i32");
+    for (int t = 0; t < BTT; ++t) {
+      const std::string tokc =
+          t == 0 ? mtok0
+                 : e.val("arith.addi " + mtok0 + ", " +
+                         e.val("arith.constant " + s(t) + " : i32") + " : i32");
+      const std::string tok_ok =
+          e.val("arith.cmpi slt, " + tokc + ", %n : i32");
+      const std::string ok =
+          e.val("arith.andi " + mok + ", " + tok_ok + " : i1");
+      e.op("scf.if " + ok + " {");
+      const std::string tok64 = e.val("arith.extsi " + tokc + " : i32 to i64");
+      const std::string off0 =
+          e.val("arith.muli " + tok64 + ", " + m64 + " : i64");
+      const std::string mrow64 =
+          e.val("arith.extsi " + gmrow + " : i32 to i64");
+      const std::string off =
+          e.val("arith.addi " + off0 + ", " + mrow64 + " : i64");
+      const std::string p = e.val("llvm.getelementptr %y[" + off +
+                                  "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+      const std::string ys =
+          e.val("arith.mulf %g" + s(r * BTT + t) + ", %alpha : f32");
+      e.op("llvm.store " + ys + ", " + p + " : f32, !llvm.ptr");
+      e.op("}");
+    }
+  }
+  e.op("gpu.return");
+  e.op("}");
+
+  std::string text = "module attributes {gpu.container_module} {\n";
+  text += "  gpu.module @gemm [#nvvm.target<chip = \"sm_" + s(gfx_arch) +
+          "\">] {\n";
+  text += "      " + FUNC + "\n" + e.body + "\n";
+  text += "  }\n}\n";
+  return text;
+}
+
 } // namespace
 
 bool dense_gemm_shape_supported(const DenseGemmShape &shape) {
   if (shape.bm <= 0 || shape.bn <= 0 || shape.bk <= 0) return false;
   if (shape.bm % 16 != 0 || shape.bn % 8 != 0 || shape.bk % 16 != 0)
     return false;
+#if defined(SONICBOOM_USE_ROCM)
+  // The AMD body: 256 threads, a 4-row register tile, and one staged slab per
+  // K step. bm*bn/256 must split exactly into 4 x btt tiles across the block.
+  if ((shape.bm * shape.bn) % kAmdDenseGemmThreads != 0) return false;
+  const int out = shape.bm * shape.bn / kAmdDenseGemmThreads;
+  if (out <= 0 || out % 4 != 0) return false;
+  const int btt = out / 4;
+  if (btt <= 0 || btt > 16 || shape.bn % btt != 0) return false;
+  return dense_gemm_shared_bytes(shape) <= kAmdDenseGemmLdsBytes;
+#else
   if (shape.bm / 16 > 8) return false;  // at most 256 threads
   if (shape.bn / 8 > 16) return false;  // at most 16 f32 accumulators/lane
   // Up to 96 KiB of dynamic shared memory; the loader raises the per-function
   // limit above 48 KiB.
   return dense_gemm_shared_bytes(shape) <= 96 * 1024;
+#endif
 }
 
 int dense_gemm_block_threads(const DenseGemmShape &shape) {
+#if defined(SONICBOOM_USE_ROCM)
+  (void)shape;  // the scalar body fixes the block; the tile sets its registers
+  return kAmdDenseGemmThreads;
+#else
   return (shape.bm / 16) * 32;
+#endif
 }
 
 int dense_gemm_shared_bytes(const DenseGemmShape &shape) {
+  const int row = shape.bk + 8;
+#if defined(SONICBOOM_USE_ROCM)
+  // One staged slab each for W and X (see gemm_region_text_amd), rows padded by
+  // 8 elements so the 8-wide vector loads stay 16-byte aligned.
+  return (shape.bm * row + shape.bn * row) * 2;
+#else
   // Double-buffered A and B stages, each row padded by 8 elements (see
   // gemm_region_text) so ldmatrix does not read every row from the same bank.
-  const int row = shape.bk + 8;
   return 2 * (shape.bm * row + shape.bn * row) * 2;
+#endif
 }
 
 std::optional<std::string> generate_dense_gemm_ptx(const DenseGemmShape &shape,
@@ -404,10 +700,29 @@ std::optional<std::string> generate_dense_gemm_ptx(const DenseGemmShape &shape,
   return lower_gpu_module_to_ptx(text, /*link_libdevice=*/false, "dense-gemm");
 }
 
+std::optional<std::string> generate_dense_gemm_hsaco(const DenseGemmShape &shape,
+                                                     int gfx_arch) {
+#if defined(SONICBOOM_USE_ROCM)
+  if (gfx_arch <= 0 || !dense_gemm_shape_supported(shape)) return std::nullopt;
+  const std::string text = gemm_region_text_amd(shape, gfx_arch);
+  const AmdKernelBlock block{kDenseGemmKernelEntry,
+                             dense_gemm_block_threads(shape)};
+  const std::string adapted = amdgpu_adapt_module_text(
+      text, gfx_arch, std::span<const AmdKernelBlock>(&block, 1));
+  return lower_gpu_module_to_hsaco(adapted, /*link_libdevice=*/false,
+                                   "dense-gemm");
+#else
+  (void)shape;
+  (void)gfx_arch;
+  return std::nullopt;
+#endif
+}
+
 std::string dense_gemm_codegen_version() {
   // gemm2: padded shared staging (conflict-free ldmatrix); gemm3: scalar
-  // scale epilogue (the folded `scale` consumer).
-  return std::string("llvm-") + LLVM_VERSION_STRING + "-gemm3";
+  // scale epilogue (the folded `scale` consumer); gemm4: the AMD scalar body
+  // (the version keys the disk cache for both backends).
+  return std::string("llvm-") + LLVM_VERSION_STRING + "-gemm4";
 }
 
 } // namespace sonicboom::compiler

@@ -420,6 +420,21 @@ if(SONICBOOM_USE_ROCM)
   sb_add_cpp_test(test_hip_attention_prefill_codegen)
   set_tests_properties(test_hip_attention_prefill_codegen
     PROPERTIES RESOURCE_LOCK gpu_vram)
+
+  # The generated dense GEMM on the ROCm backend: the AMD body is the scalar
+  # shared-staged variant (the tensor-core body has no ROCDL lowering).
+  add_executable(test_hip_dense_gemm_codegen test_hip_dense_gemm_codegen.cpp)
+  target_link_libraries(test_hip_dense_gemm_codegen
+                        PRIVATE sonicboom sonicboom_compiler hip::host
+                                MLIRBuiltinToLLVMIRTranslation
+                                MLIRLLVMToLLVMIRTranslation)
+  target_link_options(test_hip_dense_gemm_codegen
+                      PRIVATE "-Wl,--exclude-libs,ALL")
+  target_compile_definitions(test_hip_dense_gemm_codegen
+                             PRIVATE SONICBOOM_USE_ROCM=1)
+  sb_add_cpp_test(test_hip_dense_gemm_codegen)
+  set_tests_properties(test_hip_dense_gemm_codegen
+    PROPERTIES RESOURCE_LOCK gpu_vram)
 endif()
 
 # Static execution planner tests (unit + integration). They include only

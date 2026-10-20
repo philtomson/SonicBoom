@@ -50,7 +50,8 @@
 
 #include <sonicboom/compiler/GlueCodegen.h>
 
-#include <llvm/Config/llvm-config.h>  // LLVM_VERSION_STRING (cache key)
+#include <llvm/Config/llvm-config.h>
+#include <llvm/Support/raw_ostream.h>  // LLVM_VERSION_STRING (cache key)
 #include <mlir/Conversion/ArithToLLVM/ArithToLLVM.h>
 #include <mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h>
 #include <mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h>
@@ -1988,6 +1989,11 @@ std::optional<std::string> lower_gpu_module_to_hsaco(std::string_view mlir_text,
         mlir::IntegerAttr::get(mlir::IntegerType::get(&context, 32),
                                static_cast<int32_t>(flat)));
   });
+
+  // The ROCDL conversion is opaque and a leftover typed bridge surfaces only
+  // as a serializer diagnostic, so allow dumping the converted module.
+  if (const char *d = std::getenv("SONICBOOM_DUMP_HSACO_IR"); d && *d)
+    module->print(llvm::errs());
 
   mlir::PassManager binary_pm(&context);
   mlir::GpuModuleToBinaryPassOptions binary;

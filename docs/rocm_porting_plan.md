@@ -3,7 +3,7 @@
 Status: **active** — Phase 0-2 complete (branch `amd_dev`), Phase 4 under way
 (vendor-neutral device gate + vendor-neutral device/backend IDs landed; the
 per-op and device-resident forward paths run on AMD), Phase 3 started
-(generated decode and prefill attention run on AMD; the dense GEMM is open).
+(generated decode and prefill attention and the dense bf16 GEMM run on AMD).
 `origin/master` merged in
 (bb8e43f): upstream's training/backward work is CUDA-gated in its host files,
 so the ROCm build takes it as host-only code; two conflicts (NVTX include,
@@ -261,8 +261,53 @@ skips when no AMD device is present).
       their static `Codegen` default, d64 keeps `Own`; because
       `attn_launch_own` now works on ROCm, the runtime tuner can compare both
       when `SONICBOOM_ATTN_CODEGEN` is on.
-- [ ] Dense bf16 GEMM on AMD: same treatment for `GemmCodegen` (the CUDA body
-      is mma/cp.async); `launch_dense_gemm` still returns false on ROCm.
+- [x] **Generated dense bf16 GEMM runs on AMD.** As with attention, the
+      NVIDIA body is tensor-core-only (`nvgpu.ldmatrix`/`mma.sync`, `cp.async`)
+      and `generate_dense_gemm_ptx` was the only path, so
+      `launch_dense_gemm` was `#if SONICBOOM_USE_CUDA` and returned false on
+      ROCm. `GemmCodegen.cpp` now has a second emitter for the backend switch:
+      one BK slab of W and X per K step is staged cooperatively in shared
+      memory (scalar loads, zero fill outside `m`/`k`/`n`), then each of the
+      256 threads accumulates a 4 x (bm*bn/1024) register tile out of that slab
+      with 8-wide bf16 vector loads, `arith.extf` to f32 and
+      `vector.reduction <add>`; single-buffered with two `gpu.barrier`s per
+      step. Same kernel ABI (memref descriptors + `m`,`k`,`n`,`alpha`), same
+      `Y[token][row]` contract and the same exact `alpha * acc` epilogue.
+      `dense_gemm_block_threads` returns 256 and `dense_gemm_shared_bytes` one
+      slab for the AMD body; `dense_gemm_shape_supported` checks the derived
+      4 x btt register tile and the 64 KiB LDS budget instead of the mma tile
+      rules. `planner/glue_jit` gained the HSACO cache/load/launch twin, and
+      `hip_elementwise.hip` needed no change: its dense path already calls
+      `launch_dense_gemm` and falls through to the rocBLAS/gemv arm when the
+      generated tile is not chosen.
+      `tests/core/test_hip_dense_gemm_codegen.cpp` checks all ten autotune
+      candidate tiles plus a tail shape (m=1000, k=1000, n=7), the exact scale
+      epilogue, and bitwise batch invariance (a token's row must not depend on
+      N or on its block coordinate, which is what lets the planner drop the
+      fixed 128-column blocking). Relative error vs fp64 is 8.9e-7..1.2e-6,
+      i.e. the f32 accumulation order is not the accuracy limit.
+      On this build hipBLAS is reached only through weak symbols
+      (`nn/hip_blas.h`, to keep ROCm's LLVM out of the process), so the test's
+      rocBLAS baseline arm is skipped when the runtime has not loaded it — and
+      in a plain SonicBoom process it is *not* loaded, which means the dense
+      tuner's baseline arm fails and the generated tile is selected for every
+      shape class. That is the intended AMD dense path; it is a scalar f32
+      kernel, so `MFMA` remains the optimization item below.
+      Perf is not benchmarked (functional-first); the tuner still times every
+      candidate, so a faster body can replace it without touching the planner.
+      Full suite 90/90, 5 expected skips.
+
+      Pipeline note, found the hard way: `vector.load` from a **workgroup**
+      memref is not converted by `ConvertGpuOpsToROCDLOps` (the standalone
+      vector-to-LLVM pass has no workgroup memory-space mapping), so it
+      survives to the translation as an unrealized cast and fails with
+      "conversion of memref memory space #gpu.address_space<workgroup> failed".
+      The body therefore stages with scalar `memref.store` and reads through a
+      second `memref.view` of the same slab typed
+      `memref<N x (BK+8)/8 x vector<8xbf16>>`, so `memref.load` yields the
+      vector directly. `SONICBOOM_DUMP_HSACO_IR=1` prints the fully converted
+      module before serialization; the ROCDL failure itself only shows up as a
+      serializer diagnostic.
 - [ ] Optimize later: `MFMA` (fp16 `MFMA_F32_16x16x16_F16`),
       `ds_read_b64`, `s_waitcnt`/bulk prefetch (follow-up).
 

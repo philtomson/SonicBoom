@@ -17,11 +17,18 @@
 #pragma once
 
 // The generated dense bf16 GEMM (v1 Stage 6). Emitted in the GPU dialect and
-// lowered through the same NVVM pipeline as the glue regions and the generated
+// lowered through the same pipeline as the glue regions and the generated
 // attention kernels:
 //
 //   gpu.func + nvgpu.mma.sync / nvgpu.ldmatrix / nvgpu.device_async_copy
-//       -> nvvm -> PTX
+//       -> nvvm -> PTX          (CUDA)
+//   gpu.func + scalar f32 fma + workgroup staging
+//       -> rocdl -> HSACO       (AMDGPU)
+//
+// The AMD body has no tensor-core ops (the ROCDL pipeline does not lower the
+// nvgpu ones): it stages one BK slab per step in shared memory and computes a
+// 4 x (outputs/thread/4) register tile per thread with 8-wide bf16 vector
+// loads and f32 reductions.
 //
 // Operands and result (the strided dense projection's layout):
 //   X  [N][K] bf16, token-major (K contiguous)
@@ -67,8 +74,9 @@ struct DenseGemmShape {
 // within the 96 KiB dynamic shared-memory limit.
 bool dense_gemm_shape_supported(const DenseGemmShape &shape);
 
-// Launch geometry: (bm/16)*32 threads per block; grid (ceil(N/bn),
-// ceil(M/bm)).
+// Launch geometry: grid (ceil(N/bn), ceil(M/bm)). CUDA: (bm/16)*32 threads
+// per block; AMDGPU: kAmdDenseGemmThreads (256) -- the scalar body fixes the
+// thread count and derives its per-thread register tile from it.
 int dense_gemm_block_threads(const DenseGemmShape &shape);
 int dense_gemm_shared_bytes(const DenseGemmShape &shape);
 
@@ -80,6 +88,12 @@ constexpr const char *kDenseGemmKernelEntry = "gemm";
 // shape has no generator or lowering fails.
 std::optional<std::string> generate_dense_gemm_ptx(const DenseGemmShape &shape,
                                                    int sm_arch);
+
+// The AMDGPU twin: emit the scalar body and lower it to an HSA code object for
+// `gfx_arch` (1151 = gfx1151). nullopt on a non-ROCm build, an unsupported
+// shape, or any lowering failure.
+std::optional<std::string> generate_dense_gemm_hsaco(const DenseGemmShape &shape,
+                                                     int gfx_arch);
 
 // The identity of the generator, stamped into the JIT disk cache entry (same
 // contract as glue_codegen_version / attention_codegen_version).

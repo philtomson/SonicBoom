@@ -162,6 +162,17 @@ std::string dense_gemm_region_name(const compiler::DenseGemmShape &shape) {
          "k" + std::to_string(shape.bk);
 }
 
+// A memref<?x?xbf16> kernel argument is passed as its flattened 7-field
+// descriptor: allocated ptr, aligned ptr, offset, size0, size1, stride0,
+// stride1. Both GEMM operands are K-contiguous, so stride = (k, 1); x is
+// indexed [token][k] and w [row][k] by the kernel.
+struct MemRef2D {
+  void *allocated;
+  void *aligned;
+  int64_t offset;
+  int64_t size0, size1, stride0, stride1;
+};
+
 #if SONICBOOM_USE_CUDA
 
 struct LoadedKernel {
@@ -553,6 +564,62 @@ bool load_attention(const compiler::AttentionShape &shape,
   return true;
 }
 
+// The generated dense GEMM's HSACO: disk cache first, generator on a miss.
+// Same entry format and trust model as region_hsaco.
+std::string dense_gemm_hsaco(const compiler::DenseGemmShape &shape, int arch) {
+  if (arch <= 0 || !compiler::dense_gemm_shape_supported(shape)) return {};
+  const std::string region = dense_gemm_region_name(shape);
+  const std::string codegen = compiler::dense_gemm_codegen_version();
+  const std::filesystem::path path = cache_path(region, arch);
+  if (use_disk_cache()) {
+    const std::string cached = read_file(path);
+    if (!cached.empty()) {
+      std::string body = validate_entry(cached, region, arch, codegen);
+      if (!body.empty()) return body;
+      std::fprintf(stderr, "glue JIT: ignoring stale HSACO cache entry %s\n",
+                   path.c_str());
+    }
+  }
+  auto generated = compiler::generate_dense_gemm_hsaco(shape, arch);
+  if (!generated) return {};
+  if (use_disk_cache())
+    write_file(path, make_entry(region, arch, codegen, *generated));
+  return std::move(*generated);
+}
+
+bool load_dense_gemm(const compiler::DenseGemmShape &shape,
+                     std::string_view key, int shared_bytes, LoadedKernel &out) {
+  // gfx11 workgroups get their full 64 KiB of LDS by default (the generator
+  // rejects shapes that ask for more): unlike CUDA there is no per-function
+  // dynamic shared-memory limit to raise.
+  (void)shared_bytes;
+  const int arch = gfx_arch();
+  const std::string hsaco = dense_gemm_hsaco(shape, arch);
+  if (hsaco.empty()) {
+    std::fprintf(stderr,
+                 "glue JIT: no generated dense GEMM HSACO for '%.*s'\n",
+                 int(key.size()), key.data());
+    return false;
+  }
+  if (hipModuleLoadData(&out.module, hsaco.data()) != hipSuccess) {
+    std::fprintf(stderr,
+                 "glue JIT: hipModuleLoadData failed for '%.*s': %s\n",
+                 int(key.size()), key.data(),
+                 hipGetErrorString(hipGetLastError()));
+    return false;
+  }
+  if (hipModuleGetFunction(&out.function, out.module,
+                           compiler::kDenseGemmKernelEntry) != hipSuccess) {
+    std::fprintf(stderr,
+                 "glue JIT: hipModuleGetFunction failed for '%.*s': %s\n",
+                 int(key.size()), key.data(), hipGetErrorString(hipGetLastError()));
+    (void)hipModuleUnload(out.module);
+    out = {};
+    return false;
+  }
+  return true;
+}
+
 #endif // SONICBOOM_USE_CUDA / SONICBOOM_USE_ROCM
 
 } // namespace
@@ -879,16 +946,6 @@ bool launch_dense_gemm(const compiler::DenseGemmShape &shape, const void *x,
   }
   if (function == nullptr) return false;
 
-  // A memref<?x?xbf16> kernel argument is passed as its flattened 7-field
-  // descriptor: allocated ptr, aligned ptr, offset, size0, size1, stride0,
-  // stride1. Both operands are K-contiguous, so stride = (k, 1); x is indexed
-  // [token][k] and w [row][k] by the kernel.
-  struct MemRef2D {
-    void *allocated;
-    void *aligned;
-    int64_t offset;
-    int64_t size0, size1, stride0, stride1;
-  };
   MemRef2D xd{const_cast<void *>(x), const_cast<void *>(x), 0, n, k, k, 1};
   MemRef2D wd{const_cast<void *>(w), const_cast<void *>(w), 0, m, k, k, 1};
   int mi = m, ki = k, ni = n;
@@ -915,6 +972,58 @@ bool launch_dense_gemm(const compiler::DenseGemmShape &shape, const void *x,
   if (r != CUDA_SUCCESS) {
     std::fprintf(stderr, "glue JIT: cuLaunchKernel failed for '%s': %s\n",
                  key.c_str(), cu_error(r));
+    return false;
+  }
+  return true;
+#elif SONICBOOM_USE_ROCM
+  if (m <= 0 || k <= 0 || n <= 0 || x == nullptr || w == nullptr ||
+      y == nullptr)
+    return false;
+  if (!compiler::dense_gemm_shape_supported(shape)) return false;
+  const int threads = compiler::dense_gemm_block_threads(shape);
+  const int shared_bytes = compiler::dense_gemm_shared_bytes(shape);
+  const std::string key = dense_gemm_region_name(shape);
+  hipFunction_t function = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex());
+    auto &cache = kernel_cache();
+    auto it = cache.find(key);
+    if (it == cache.end()) {
+      LoadedKernel loaded;
+      if (!load_dense_gemm(shape, key, shared_bytes, loaded)) return false;
+      it = cache.emplace(key, loaded).first;
+    }
+    function = it->second.function;
+  }
+  if (function == nullptr) return false;
+
+  MemRef2D xd{const_cast<void *>(x), const_cast<void *>(x), 0, n, k, k, 1};
+  MemRef2D wd{const_cast<void *>(w), const_cast<void *>(w), 0, m, k, k, 1};
+  int mi = m, ki = k, ni = n;
+  float a = alpha;
+  void *args[19] = {&xd.allocated, &xd.aligned, &xd.offset, &xd.size0,
+                    &xd.size1,     &xd.stride0, &xd.stride1,
+                    &wd.allocated, &wd.aligned, &wd.offset, &wd.size0,
+                    &wd.size1,     &wd.stride0, &wd.stride1,
+                    &y,            &mi,         &ki,        &ni,
+                    &a};
+  const int gx = (n + shape.bn - 1) / shape.bn;
+  const int gy = (m + shape.bm - 1) / shape.bm;
+
+  if (auto *rec = sonicboom::planner::recorder()) {
+    rec->add_launch(key, "", unsigned(gx), unsigned(gy), 1, unsigned(threads),
+                    1, 1, static_cast<uint64_t>(shared_bytes),
+                    reinterpret_cast<const void *>(
+                        sonicboom::hip::sb_current_stream()));
+  }
+  const hipError_t r = hipModuleLaunchKernel(
+      function, unsigned(gx), unsigned(gy), 1, unsigned(threads), 1, 1,
+      static_cast<unsigned>(shared_bytes), sonicboom::hip::sb_current_stream(),
+      args, nullptr);
+  if (r != hipSuccess) {
+    std::fprintf(stderr,
+                 "glue JIT: hipModuleLaunchKernel failed for '%s': %s\n",
+                 key.c_str(), hipGetErrorString(r));
     return false;
   }
   return true;
