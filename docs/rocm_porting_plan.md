@@ -328,18 +328,35 @@ skips when no AMD device is present).
       a tile (one accumulator tile = 8 f32 registers per lane, capped at 8
       tiles per lane); the 64 KiB LDS budget still bounds the slab.
       Measured on gfx1151: a 1024x1024x1024 bf16 GEMM with the 128x128x64 tile
-      runs in 0.55 ms (~3.9 TFLOP/s). The scalar body it replaces was not
-      benchmarked before it was removed, and rocBLAS is not loadable in this
-      process (weak hipBLAS symbols, see below), so the headroom is unmeasured.
-      It is a functional first cut, not a tuned kernel: the remaining items are
-      double buffering / `s_waitcnt`, reusing the A fragment across N tiles,
-      and `ds_read_b64` scheduling.
-      Numerics: relative error vs fp64 stays 3.6e-6..4.1e-6 over all ten
-      autotune tiles and the tail shape, batch invariance is still bitwise, and
-      the scale epilogue is still exact. `dense_gemm_codegen_version` bumps to
-      `gemm5` (the body changed; the disk cache would otherwise serve the
-      scalar HSACO). The test grew to cover the full candidate list, which is
-      what exercises 1..8 WMMA tiles per warp.
+      runs in 0.55 ms (~3.9 TFLOP/s) as committed, and in 0.14 ms (~15
+      TFLOP/s) after the tuning below. rocBLAS is not loadable in this process
+      (weak hipBLAS symbols, see below), so the remaining headroom has no
+      vendor baseline here.
+- [x] **Dense GEMM tuning: staging, double buffering, fragment reuse, LDS
+      swizzle.** Copying the slab (global load + LDS store) was ~55% of the
+      runtime: 16-byte loads were issued one at a time behind their own
+      `s_waitcnt`, and every fragment read conflicted 4-way in LDS. Four
+      changes, all inside `gemm_region_text_amd`:
+        * staging is 8 bf16 (16 B) per lane per chunk with the chunk index fully
+          unrolled (every candidate's chunk count divides its block size), so a
+          thread's four global loads are all in flight before the first LDS
+          store; a clamped address plus `arith.select` replaces the per-chunk
+          branch, and the `K % 8 != 0` case keeps the scalar per-element loop;
+        * the slab is double-buffered whenever two pairs fit the 64 KiB LDS
+          budget (every candidate but 128x128x64, which keeps the single buffer
+          and two barriers per step): step kt+1 is staged while kt computes and
+          one `gpu.barrier` per step publishes it;
+        * a warp owns a 16-row strip, so its A fragment is one LDS read per
+          16-K step shared by all of its tiles instead of one per tile;
+        * LDS rows are XOR-swizzled in 8-element chunks by the row index, so a
+          fragment is two 16-byte reads at `2*ks ^ m` / `2*ks+1 ^ m` joined by
+          a register-only shuffle; the 16 lane rows then hit 8 bank groups
+          instead of 4. Worth ~20% on the BK=64 tiles by itself.
+      Numerics unchanged: relative error vs fp64 stays 3.6e-6..4.1e-6 over all
+      ten autotune tiles and the tail shape, batch invariance is still bitwise,
+      and the scale epilogue is still exact. `dense_gemm_codegen_version` bumps
+      to `gemm6`. The test covers the full candidate list, which is what
+      exercises 1..8 WMMA tiles per warp and both buffer modes.
 
 ### Phase 4 — Layer-2 hygiene + tests
 - [x] **Vendor-neutral device gate.** `quant::gpu_available()` and
@@ -458,11 +475,14 @@ not of this port:
 - LLVM/MLIR rebuild with AMDGPU is the long pole (hours); submodule not expanded.
 - Attention/GEMM codegen is NVIDIA-mma-specific and stays that way for CUDA;
   the functional AMD bodies are new code, not a flag flip (Phase 3).
-- The AMD dense GEMM body uses WMMA (RDNA has no MFMA) but is untuned:
-  single-buffered staging, no A-fragment reuse across N tiles, ~3.9 TFLOP/s on
-  a 1024^3 GEMM (rocBLAS is several times faster, when it is loadable at all).
-  gfx1151's 64 KiB LDS is checked at codegen (the dense body rejects tiles that
-  do not fit); the generated attention bodies use no LDS on AMD.
+- The AMD dense GEMM body uses WMMA (RDNA has no MFMA) and reaches ~15 TFLOP/s
+  on a 1024^3 GEMM (128x128x64 tile), up from 3.9. rocBLAS is several times
+  faster when it is loadable at all, so headroom remains: the staged slab is
+  still the largest single cost, the 128x128x64 candidate cannot be
+  double-buffered in 64 KiB of LDS, and the fragment feed relies on the
+  compiler to batch LDS reads (it still emits an `s_waitcnt lgkmcnt(0)` per
+  fragment). gfx1151's 64 KiB LDS is checked at codegen (the dense body rejects
+  tiles that do not fit); the generated attention bodies use no LDS on AMD.
 - Wave width / shared-memory / async-copy semantics differ; wave32 is pinned
   (see Phase 2).
 - The HIP spine compiles and links but has not been run end-to-end (no model

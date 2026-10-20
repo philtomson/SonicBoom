@@ -395,31 +395,53 @@ std::string gemm_region_text(const DenseGemmShape &sh, int sm_arch) {
 // with no cross-lane traffic. Operands are therefore "one K-contiguous row"
 // fragments (X's token row, W's row): no ldmatrix, no transposes.
 //
-// The staging is the scalar body's single-buffered BK slab (cooperative scalar
-// loads, zero fill out of range, two barriers per step); each fragment is one
-// 32-byte LDS read. A warp owns TPT whole 16x16 tiles (tile = warp + slot *
-// WARPS) and keeps 8 f32 accumulators per tile across the K loop; the epilogue
-// writes Y[token * M + row] with the same exact `alpha * acc` as the other
-// bodies. Thread count follows the tile count (WARPS below).
+// Staging moves 8 bf16 (16 B) per lane per chunk, so a BK = 64 slab is four
+// vector loads per lane instead of 32 scalar ones, and the chunk index is fully
+// unrolled so all of a thread's global loads are in flight before its first LDS
+// store. A staged row is 16-byte aligned only when K is a multiple of 8, so
+// that is a runtime branch: the fast path clamps the address and selects a zero
+// vector out of range, the slow path is the scalar per-element loop with zero
+// fill.
+//
+// The slab is double-buffered whenever it fits the 64 KiB LDS budget
+// (2 * (BM + BN) * (BK + 16) * 2 bytes: every candidate tile but 128x128x64).
+// K step kt+1 is then staged into the second buffer while kt computes, and a
+// single `gpu.barrier` per step publishes it; shapes that do not fit keep the
+// single buffer and two barriers per step.
+//
+// A warp owns a 16-row strip (mi = warp % MT) and TPT whole 16x16 tiles across
+// the block's columns (ni = warp / MT + slot * WPG), so its A fragment is one
+// LDS read per 16-K step shared by all of its tiles; 8 f32 accumulators per
+// tile stay in registers across the K loop. LDS rows are XOR-swizzled in
+// 8-element chunks by the row index, so a fragment is two 16-byte reads joined
+// by a register-only shuffle and the 16 lane rows of a fragment land on 8 bank
+// groups instead of 4. The epilogue writes Y[token * M + row] with the same
+// exact `alpha * acc` as the other bodies.
 std::string gemm_region_text_amd(const DenseGemmShape &sh, int gfx_arch) {
   const int BM = sh.bm;
   const int BN = sh.bn;
   const int BK = sh.bk;
   constexpr int kPad = kAmdWmmaPad;  // elements; 32-byte LDS row alignment
   const int BKW = BK + kPad;
-  const int NV = BKW / 16;           // vector<16xbf16> slots per LDS row
-  const int NT = BN / 16;            // 16-column tiles per row of the block
-  const int TILES = (BM / 16) * (BN / 16);
+  const int NV8 = BKW / 8;           // vector<8xbf16> slots per LDS row
+  const int NS8 = BK / 8;            // ... of which this many hold staged data
+  const int MT = BM / 16;            // 16-row tiles down the block
+  const int NT = BN / 16;            // 16-column tiles across the block
+  const int TILES = MT * NT;
   const int WARPS = TILES >= 8 ? 8 : 4;
   const int THREADS = WARPS * 32;
-  const int TPT = TILES / WARPS;     // whole tiles per warp
+  const int WPG = WARPS / MT;        // warps sharing one 16-row strip
+  const int TPT = NT / WPG;          // whole tiles per warp
   const int KS = BK / 16;            // 16-K WMMA steps per staged slab
   constexpr int BRT = 16;            // rows of a WMMA tile
-  constexpr int BCT = 16;            // columns of a WMMA tile
   constexpr int ACC = 8;             // f32 accumulators per tile per lane
-  const int StagedA = BM * BK;
-  const int StagedB = BN * BK;
-  const int BStage = BM * BKW * 2;   // bytes; B starts after A
+  const int CH8 = BK / 8;            // 8-bf16 chunks per staged row
+  const int CHA = BM * CH8;          // staged chunks in the W slab
+  const int CHB = BN * CH8;          // staged chunks in the X slab
+  const int SlabA = BM * BKW * 2;    // bytes
+  const int SlabB = BN * BKW * 2;
+  const int Pair = SlabA + SlabB;    // bytes; A plus B of one buffer
+  const bool DB = 2 * Pair <= kAmdDenseGemmLdsBytes;
   const std::string SmemTy = "#gpu.address_space<workgroup>";
 
   Emitter e;
@@ -449,43 +471,26 @@ std::string gemm_region_text_amd(const DenseGemmShape &sh, int gfx_arch) {
   for (int i = 4; i < 2 * ACC; i += 2) c32(("c" + s(i)).c_str(), i);
   c32("cbm", BM); c32("cbn", BN);
   c64("l0", 0); c64("l1", 1);
-  ci("i0", 0); ci("i1", 1); ci("i8", 8); ci("i16", BRT); ci("i32", 32);
+  ci("i0", 0); ci("i1", 1); ci("i2", 2); ci("i8", 8); ci("i16", BRT);
+  ci("i32", 32);
   ci("ith", THREADS);
   ci("ibk", BK);
-  ci("ibsoff", BStage);
-  ci("icha", StagedA);
-  ci("ichb", StagedB);
-  ci("int", NT);
-  ci("itpt", TPT);
+  ci("ich8", CH8);
+  ci("imask", NS8 - 1);
+  ci("icha", CHA);
+  ci("ichb", CHB);
+  ci("islaba", SlabA);
+  ci("ipair", Pair);
+  ci("imt", MT);
   cf("cf0", "0.0");
   C["czero"] = e.val("arith.constant dense<0.0> : vector<8xf32>");
+  C["czerobf"] = e.val("arith.constant dense<0.0> : vector<8xbf16>");
 
   const std::string tid = e.val("gpu.thread_id x");
   const std::string bx = e.val("gpu.block_id x");
   const std::string by = e.val("gpu.block_id y");
   const std::string smem =
       e.val("gpu.dynamic_shared_memory : memref<?xi8, " + SmemTy + ">");
-  const std::string asm_ =
-      e.val("memref.view " + smem + "[" + C["i0"] +
-            "][] : memref<?xi8, " + SmemTy + "> to memref<" + s(BM) + "x" +
-            s(BKW) + "xbf16, " + SmemTy + ">");
-  const std::string bsm =
-      e.val("memref.view " + smem + "[" + C["ibsoff"] +
-            "][] : memref<?xi8, " + SmemTy + "> to memref<" + s(BN) + "x" +
-            s(BKW) + "xbf16, " + SmemTy + ">");
-  // Readers view the same slabs as 16-wide bf16 vectors: `vector.load` from a
-  // workgroup memref is not converted by the ROCDL pipeline (it needs the
-  // workgroup memory-space mapping that only the GPU conversion registers),
-  // while `memref.load` of a vector element type is. A WMMA fragment is one
-  // such 32-byte load per lane.
-  const std::string asmv =
-      e.val("memref.view " + smem + "[" + C["i0"] +
-            "][] : memref<?xi8, " + SmemTy + "> to memref<" + s(BM) + "x" +
-            s(NV) + "xvector<16xbf16>, " + SmemTy + ">");
-  const std::string bsmv =
-      e.val("memref.view " + smem + "[" + C["ibsoff"] +
-            "][] : memref<?xi8, " + SmemTy + "> to memref<" + s(BN) + "x" +
-            s(NV) + "xvector<16xbf16>, " + SmemTy + ">");
   const std::string bxi = e.val("arith.index_cast " + bx + " : index to i32");
   const std::string byi = e.val("arith.index_cast " + by + " : index to i32");
   const std::string n0 = e.val("arith.muli " + bxi + ", " + C["cbn"] +
@@ -495,90 +500,262 @@ std::string gemm_region_text_amd(const DenseGemmShape &sh, int gfx_arch) {
   const std::string kidx = e.val("arith.index_cast %k : i32 to index");
   const std::string ktmax =
       e.val("arith.ceildivui " + kidx + ", " + C["ibk"] + " : index");
+  const std::string krem =
+      e.val("arith.remui " + kidx + ", " + C["i8"] + " : index");
+  const std::string fast =
+      e.val("arith.cmpi eq, " + krem + ", " + C["i0"] + " : index");
 
-  // Wave coordinates: a warp owns whole 16x16 tiles; lane % 16 picks the tile
-  // row (A) / tile column (B) and lane / 16 picks the odd accumulator rows.
-  const std::string warp = e.val("arith.divui " + tid + ", " + C["i32"] +
-                                 " : index");
-  const std::string lane = e.val("arith.remui " + tid + ", " + C["i32"] +
-                                 " : index");
-  const std::string l16 = e.val("arith.remui " + lane + ", " + C["i16"] +
-                                " : index");
-  const std::string hi = e.val("arith.divui " + lane + ", " + C["i16"] +
-                               " : index");
-  const std::string hi32 = e.val("arith.index_cast " + hi + " : index to i32");
-  const std::string l32 = e.val("arith.index_cast " + l16 + " : index to i32");
+  // One buffer holds the W slab at its base and the X slab after it, viewed
+  // twice: bf16 (scalar staging fallback) and vector<8xbf16> (staging and
+  // fragment reads). `vector.load` from a workgroup memref is not converted by
+  // the ROCDL pipeline, while `memref.load` of a vector element type is.
+  //
+  // Each row is XOR-swizzled in 8-element chunks by its own row index: chunk c
+  // of row r is stored at c ^ (r & (NS8 - 1)). A fragment is then two 16-byte
+  // reads at (2*ks ^ m) and (2*ks+1 ^ m), which puts the 16 lane rows of a
+  // fragment (row stride BKW/2 dwords) on 8 distinct bank groups instead of 4.
+  struct SlabViews {
+    std::string a_s, b_s, a_8, b_8;
+  };
+  const auto mkviews = [&](const std::string &off) {
+    SlabViews v;
+    const std::string boff =
+        e.val("arith.addi " + off + ", " + C["islaba"] + " : index");
+    const auto mv = [&](const std::string &base, const std::string &ty) {
+      return e.val("memref.view " + smem + "[" + base +
+                   "][] : memref<?xi8, " + SmemTy + "> to " + ty);
+    };
+    v.a_s = mv(off, "memref<" + s(BM) + "x" + s(BKW) + "xbf16, " + SmemTy +
+                        ">");
+    v.b_s = mv(boff, "memref<" + s(BN) + "x" + s(BKW) + "xbf16, " + SmemTy +
+                         ">");
+    v.a_8 = mv(off, "memref<" + s(BM) + "x" + s(NV8) +
+                        "xvector<8xbf16>, " + SmemTy + ">");
+    v.b_8 = mv(boff, "memref<" + s(BN) + "x" + s(NV8) +
+                         "xvector<8xbf16>, " + SmemTy + ">");
+    return v;
+  };
 
-  std::vector<std::string> arow(TPT), brow(TPT), mrow(TPT), tcol(TPT);
-  std::vector<std::string> mbase(TPT), nbase(TPT);
-  for (int ti = 0; ti < TPT; ++ti) {
-    const std::string off = cconst(ti * WARPS);
-    const std::string t =
-        ti == 0 && WARPS == 1 ? warp
-                              : e.val("arith.addi " + warp + ", " + off +
-                                      " : index");
-    const std::string mi = e.val("arith.divui " + t + ", " + C["int"] +
-                                " : index");
-    const std::string ni = e.val("arith.remui " + t + ", " + C["int"] +
-                                " : index");
-    const std::string mi16 = e.val("arith.muli " + mi + ", " + C["i16"] +
-                                   " : index");
-    const std::string ni16 = e.val("arith.muli " + ni + ", " + C["i16"] +
-                                   " : index");
-    arow[ti] = e.val("arith.addi " + mi16 + ", " + l16 + " : index");
-    brow[ti] = e.val("arith.addi " + ni16 + ", " + l16 + " : index");
-    const std::string mi32 = e.val("arith.index_cast " + mi16 +
-                                   " : index to i32");
-    const std::string ni32 = e.val("arith.index_cast " + ni16 +
-                                   " : index to i32");
-    mbase[ti] = e.val("arith.addi " + m0 + ", " + mi32 + " : i32");
-    nbase[ti] = e.val("arith.addi " + n0 + ", " + ni32 + " : i32");
-    tcol[ti] = e.val("arith.addi " + nbase[ti] + ", " + l32 + " : i32");
-  }
-
-  // One slab: each thread stages a strided subset of the elements, loading W or
-  // X at (row, col) and zero-filling outside the runtime bounds.
-  const auto stage = [&](const char *src, const std::string &dst,
-                         const std::string &base, const char *bound,
-                         const char *chunks, int nrows, const char *tag) {
-    const std::string it = "%ci_" + std::string(tag);
-    e.op("scf.for " + it + " = " + tid + " to " + C[chunks] + " step " +
-         C["ith"] + " : index {");
-    const std::string row =
-        e.val("arith.divui " + it + ", " + C["ibk"] + " : index");
-    const std::string col =
-        e.val("arith.remui " + it + ", " + C["ibk"] + " : index");
-    const std::string row32 =
-        e.val("arith.index_cast " + row + " : index to i32");
-    const std::string grow =
-        e.val("arith.addi " + base + ", " + row32 + " : i32");
+  // Stage one slab of `nrows` x BK from K step `kt` into `dst8v`/`dstsv` (the
+  // vector<8xbf16> and bf16 views of the same buffer), zero-filling outside the
+  // runtime row and K bounds. Each thread owns a strided set of 8-element
+  // chunks; the chunk index is fully unrolled because every candidate shape
+  // divides the chunk count by the block size, so all of a thread's global
+  // loads are issued before the first LDS store instead of one latency at a
+  // time (the staged slab dominates the kernel otherwise).
+  const auto stage = [&](const char *src, int nrows, const std::string &dst8v,
+                         const std::string &dstsv, const std::string &base,
+                         const char *bound, int chunks, const char *chs,
+                         const std::string &kt, const char *tag) {
+    const std::string ty8 = "memref<" + s(nrows) + "x" + s(NV8) +
+                            "xvector<8xbf16>, " + SmemTy + ">";
+    const std::string tyb =
+        "memref<" + s(nrows) + "x" + s(BKW) + "xbf16, " + SmemTy + ">";
     const std::string ktcol =
-        e.val("arith.muli %kt, " + C["ibk"] + " : index");
-    const std::string gcol =
-        e.val("arith.addi " + ktcol + ", " + col + " : index");
-    const std::string rok =
-        e.val("arith.cmpi slt, " + grow + ", " + bound + " : i32");
-    const std::string cok =
-        e.val("arith.cmpi slt, " + gcol + ", " + kidx + " : index");
-    const std::string ok = e.val("arith.andi " + rok + ", " + cok + " : i1");
-    const std::string got = e.val("scf.if " + ok + " -> bf16 {");
-    {
-      const std::string gr =
-          e.val("arith.index_cast " + grow + " : i32 to index");
+        e.val("arith.muli " + kt + ", " + C["ibk"] + " : index");
+
+    // Fast chunk (K a multiple of 8): one clamped 16-byte global load, a zero
+    // fill when the chunk is out of range, and the swizzled LDS store.
+    const auto fast_chunk = [&](const std::string &c) {
+      const std::string row =
+          e.val("arith.divui " + c + ", " + C["ich8"] + " : index");
+      const std::string cg =
+          e.val("arith.remui " + c + ", " + C["ich8"] + " : index");
+      const std::string col =
+          e.val("arith.muli " + cg + ", " + C["i8"] + " : index");
+      const std::string row32 =
+          e.val("arith.index_cast " + row + " : index to i32");
+      const std::string grow =
+          e.val("arith.addi " + base + ", " + row32 + " : i32");
+      const std::string gcol =
+          e.val("arith.addi " + ktcol + ", " + col + " : index");
+      const std::string rok =
+          e.val("arith.cmpi slt, " + grow + ", " + bound + " : i32");
+      const std::string cok =
+          e.val("arith.cmpi slt, " + gcol + ", " + kidx + " : index");
+      const std::string ok =
+          e.val("arith.andi " + rok + ", " + cok + " : i1");
+      const std::string sr =
+          e.val("arith.select " + ok + ", " + grow + ", " + C["c0"] +
+                " : i32");
+      const std::string sc =
+          e.val("arith.select " + ok + ", " + gcol + ", " + C["i0"] +
+                " : index");
+      const std::string sri =
+          e.val("arith.index_cast " + sr + " : i32 to index");
       const std::string v =
-          e.val(std::string("memref.load %") + src + "[" + gr + ", " + gcol +
-                "] : memref<?x?xbf16>");
-      e.op("scf.yield " + v + " : bf16");
+          e.val(std::string("vector.load %") + src + "[" + sri + ", " + sc +
+                "] : memref<?x?xbf16>, vector<8xbf16>");
+      const std::string vv =
+          e.val("arith.select " + ok + ", " + v + ", " + C["czerobf"] +
+                " : vector<8xbf16>");
+      const std::string rm =
+          e.val("arith.andi " + row + ", " + C["imask"] + " : index");
+      const std::string cgp =
+          e.val("arith.xori " + cg + ", " + rm + " : index");
+      e.op("memref.store " + vv + ", " + dst8v + "[" + row + ", " + cgp +
+           "] : " + ty8);
+    };
+
+    // Slow chunk (K not a multiple of 8): per-element bounds and zero fill.
+    const auto slow_chunk = [&](const std::string &c) {
+      const std::string row =
+          e.val("arith.divui " + c + ", " + C["ich8"] + " : index");
+      const std::string cg =
+          e.val("arith.remui " + c + ", " + C["ich8"] + " : index");
+      const std::string col =
+          e.val("arith.muli " + cg + ", " + C["i8"] + " : index");
+      const std::string rm =
+          e.val("arith.andi " + row + ", " + C["imask"] + " : index");
+      const std::string cgp =
+          e.val("arith.xori " + cg + ", " + rm + " : index");
+      const std::string colp =
+          e.val("arith.muli " + cgp + ", " + C["i8"] + " : index");
+      const std::string row32 =
+          e.val("arith.index_cast " + row + " : index to i32");
+      const std::string grow =
+          e.val("arith.addi " + base + ", " + row32 + " : i32");
+      const std::string gcol =
+          e.val("arith.addi " + ktcol + ", " + col + " : index");
+      const std::string rok =
+          e.val("arith.cmpi slt, " + grow + ", " + bound + " : i32");
+      const std::string jt = "%cj_" + std::string(tag);
+      e.op("scf.for " + jt + " = " + C["i0"] + " to " + C["i8"] + " step " +
+           C["i1"] + " : index {");
+      const std::string gcj =
+          e.val("arith.addi " + gcol + ", " + jt + " : index");
+      const std::string cokj =
+          e.val("arith.cmpi slt, " + gcj + ", " + kidx + " : index");
+      const std::string okj =
+          e.val("arith.andi " + rok + ", " + cokj + " : i1");
+      const std::string got = e.val("scf.if " + okj + " -> bf16 {");
+      {
+        const std::string gr =
+            e.val("arith.index_cast " + grow + " : i32 to index");
+        const std::string g =
+            e.val(std::string("memref.load %") + src + "[" + gr + ", " + gcj +
+                  "] : memref<?x?xbf16>");
+        e.op("scf.yield " + g + " : bf16");
+      }
+      e.op("} else {");
+      {
+        const std::string z = e.val("arith.constant 0.0 : bf16");
+        e.op("scf.yield " + z + " : bf16");
+      }
+      e.op("}");
+      const std::string cjp =
+          e.val("arith.addi " + colp + ", " + jt + " : index");
+      e.op("memref.store " + got + ", " + dstsv + "[" + row + ", " + cjp +
+           "] : " + tyb);
+      e.op("}");
+    };
+
+    e.op("scf.if " + fast + " {");
+    if (chunks % THREADS == 0) {
+      for (int u = 0; u * THREADS < chunks; ++u) {
+        const std::string cu =
+            e.val("arith.addi " + tid + ", " + cconst(u * THREADS) +
+                  " : index");
+        fast_chunk(cu);
+      }
+    } else {
+      const std::string it = "%cf_" + std::string(tag);
+      e.op("scf.for " + it + " = " + tid + " to " + C[chs] + " step " +
+           C["ith"] + " : index {");
+      fast_chunk(it);
+      e.op("}");
     }
     e.op("} else {");
-    {
-      const std::string z = e.val("arith.constant 0.0 : bf16");
-      e.op("scf.yield " + z + " : bf16");
+    const std::string st = "%cs_" + std::string(tag);
+    e.op("scf.for " + st + " = " + tid + " to " + C[chs] + " step " +
+         C["ith"] + " : index {");
+    slow_chunk(st);
+    e.op("}");
+    e.op("}");
+  };
+
+  // Wave coordinates: a warp owns one 16-row strip (mi) and TPT tiles across
+  // the columns (ni). lane % 16 picks the tile row (A) / tile column (B) and
+  // lane / 16 picks the odd accumulator rows.
+  const std::string warp =
+      e.val("arith.divui " + tid + ", " + C["i32"] + " : index");
+  const std::string lane =
+      e.val("arith.remui " + tid + ", " + C["i32"] + " : index");
+  const std::string l16 =
+      e.val("arith.remui " + lane + ", " + C["i16"] + " : index");
+  const std::string hi =
+      e.val("arith.divui " + lane + ", " + C["i16"] + " : index");
+  const std::string hi32 = e.val("arith.index_cast " + hi + " : index to i32");
+  const std::string l32 = e.val("arith.index_cast " + l16 + " : index to i32");
+  const std::string mi =
+      e.val("arith.remui " + warp + ", " + C["imt"] + " : index");
+  const std::string ng =
+      e.val("arith.divui " + warp + ", " + C["imt"] + " : index");
+  const std::string mi16 =
+      e.val("arith.muli " + mi + ", " + C["i16"] + " : index");
+  const std::string arow =
+      e.val("arith.addi " + mi16 + ", " + l16 + " : index");
+  const std::string mi32 =
+      e.val("arith.index_cast " + mi16 + " : index to i32");
+  const std::string mbase = e.val("arith.addi " + m0 + ", " + mi32 +
+                                  " : i32");
+
+  std::vector<std::string> brow(TPT), tcol(TPT), bmask(TPT);
+  for (int ti = 0; ti < TPT; ++ti) {
+    const std::string off = cconst(ti * WPG);
+    const std::string ni =
+        e.val("arith.addi " + ng + ", " + off + " : index");
+    const std::string ni16 =
+        e.val("arith.muli " + ni + ", " + C["i16"] + " : index");
+    brow[ti] = e.val("arith.addi " + ni16 + ", " + l16 + " : index");
+    const std::string ni32 =
+        e.val("arith.index_cast " + ni16 + " : index to i32");
+    const std::string nbase = e.val("arith.addi " + n0 + ", " + ni32 +
+                                    " : i32");
+    tcol[ti] = e.val("arith.addi " + nbase + ", " + l32 + " : i32");
+    bmask[ti] = e.val("arith.andi " + brow[ti] + ", " + C["imask"] +
+                      " : index");
+  }
+  const std::string amask =
+      e.val("arith.andi " + arow + ", " + C["imask"] + " : index");
+
+  // One swizzled 8-element chunk of a stage, at logical column `chunk`.
+  const auto chunk = [&](const std::string &view, int nrows,
+                         const std::string &row, const std::string &mask,
+                         int chunk) {
+    return e.val("memref.load " + view + "[" + row + ", " +
+                 e.val("arith.xori " + mask + ", " + cconst(chunk) +
+                       " : index") +
+                 "] : memref<" + s(nrows) + "x" + s(NV8) +
+                 "xvector<8xbf16>, " + SmemTy + ">");
+  };
+  // A WMMA fragment: the two swizzled halves of the 16-K slice, joined in
+  // registers (only the lane's own copies move, so the shuffle is free).
+  const auto fragment = [&](const std::string &view, int nrows,
+                            const std::string &row, const std::string &mask,
+                            int ks) {
+    const std::string lo = chunk(view, nrows, row, mask, 2 * ks);
+    const std::string hi = chunk(view, nrows, row, mask, 2 * ks + 1);
+    const std::string v = e.val(
+        "vector.shuffle " + lo + ", " + hi +
+        "[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] : "
+        "vector<8xbf16>, vector<8xbf16>");
+    return e.val("arith.bitcast " + v +
+                 " : vector<16xbf16> to vector<16xi16>");
+  };
+
+  // One A fragment per 16-K step, shared by all of the warp's tiles.
+  const auto compute = [&](const SlabViews &v, std::vector<std::string> &acc) {
+    for (int ks = 0; ks < KS; ++ks) {
+      const std::string ai = fragment(v.a_8, BM, arow, amask, ks);
+      for (int ti = 0; ti < TPT; ++ti) {
+        const std::string bi = fragment(v.b_8, BN, brow[ti], bmask[ti], ks);
+        acc[ti] = e.val(
+            "rocdl.wmma.f32.16x16x16.bf16 " + ai + ", " + bi + ", " + acc[ti] +
+            " : (vector<16xi16>, vector<16xi16>, vector<8xf32>) -> "
+            "vector<8xf32>");
+      }
     }
-    e.op("}");
-    e.op("memref.store " + got + ", " + dst + "[" + row + ", " + col +
-         "] : memref<" + s(nrows) + "x" + s(BKW) + "xbf16, " + SmemTy + ">");
-    e.op("}");
   };
 
   std::vector<std::string> names;
@@ -591,37 +768,52 @@ std::string gemm_region_text_amd(const DenseGemmShape &sh, int gfx_arch) {
   }
   ia += ")";
   ty += ")";
+
+  if (DB) {
+    // Prologue: stage K step 0 into buffer 0 and publish it.
+    const SlabViews v0 = mkviews(C["i0"]);
+    stage("w", BM, v0.a_8, v0.a_s, m0, "%m", CHA, "icha", C["i0"], "a0");
+    stage("x", BN, v0.b_8, v0.b_s, n0, "%n", CHB, "ichb", C["i0"], "b0");
+    e.op("gpu.barrier");
+  }
+
   e.op(res + " = scf.for %kt = " + C["i0"] + " to " + ktmax + " step " +
        C["i1"] + " " + ia + ty + " {");
   {
-    // The slab is single-buffered: the leading barrier waits for the previous
-    // step's readers, the trailing one publishes the new stage.
-    e.op("gpu.barrier");
-    stage("w", asm_, m0, "%m", "icha", BM, "a");
-    stage("x", bsm, n0, "%n", "ichb", BN, "b");
-    e.op("gpu.barrier");
-
     std::vector<std::string> cur = names;
-    for (int ks = 0; ks < KS; ++ks) {
-      const std::string kv = cconst(ks);
-      for (int ti = 0; ti < TPT; ++ti) {
-        const std::string av = e.val(
-            "memref.load " + asmv + "[" + arow[ti] + ", " + kv +
-            "] : memref<" + s(BM) + "x" + s(NV) + "xvector<16xbf16>, " +
-            SmemTy + ">");
-        const std::string bv = e.val(
-            "memref.load " + bsmv + "[" + brow[ti] + ", " + kv +
-            "] : memref<" + s(BN) + "x" + s(NV) + "xvector<16xbf16>, " +
-            SmemTy + ">");
-        const std::string ai =
-            e.val("arith.bitcast " + av + " : vector<16xbf16> to vector<16xi16>");
-        const std::string bi =
-            e.val("arith.bitcast " + bv + " : vector<16xbf16> to vector<16xi16>");
-        cur[ti] = e.val(
-            "rocdl.wmma.f32.16x16x16.bf16 " + ai + ", " + bi + ", " + cur[ti] +
-            " : (vector<16xi16>, vector<16xi16>, vector<8xf32>) -> "
-            "vector<8xf32>");
-      }
+    if (DB) {
+      const std::string buf =
+          e.val("arith.remui %kt, " + C["i2"] + " : index");
+      const std::string nbuf =
+          e.val("arith.subi " + C["i1"] + ", " + buf + " : index");
+      const std::string kt1 =
+          e.val("arith.addi %kt, " + C["i1"] + " : index");
+      const std::string has =
+          e.val("arith.cmpi slt, " + kt1 + ", " + ktmax + " : index");
+      const std::string boff =
+          e.val("arith.muli " + buf + ", " + C["ipair"] + " : index");
+      const std::string noff =
+          e.val("arith.muli " + nbuf + ", " + C["ipair"] + " : index");
+      // Stage the next step into the other buffer while this one computes; the
+      // single trailing barrier both publishes that stage and keeps every warp
+      // from overwriting the buffer it just read.
+      e.op("scf.if " + has + " {");
+      const SlabViews vn = mkviews(noff);
+      stage("w", BM, vn.a_8, vn.a_s, m0, "%m", CHA, "icha", kt1, "a1");
+      stage("x", BN, vn.b_8, vn.b_s, n0, "%n", CHB, "ichb", kt1, "b1");
+      e.op("}");
+      const SlabViews vc = mkviews(boff);
+      compute(vc, cur);
+      e.op("gpu.barrier");
+    } else {
+      // Single buffer: the leading barrier waits for the previous step's
+      // readers, the trailing one publishes the new stage.
+      e.op("gpu.barrier");
+      const SlabViews vc = mkviews(C["i0"]);
+      stage("w", BM, vc.a_8, vc.a_s, m0, "%m", CHA, "icha", "%kt", "a0");
+      stage("x", BN, vc.b_8, vc.b_s, n0, "%n", CHB, "ichb", "%kt", "b0");
+      e.op("gpu.barrier");
+      compute(vc, cur);
     }
     std::string yields, ytypes;
     for (int i = 0; i < TPT; ++i) {
@@ -643,7 +835,7 @@ std::string gemm_region_text_amd(const DenseGemmShape &sh, int gfx_arch) {
         e.val("arith.muli " + tok64 + ", " + m64 + " : i64");
     for (int i = 0; i < ACC; ++i) {
       const int rowoff = 2 * i;
-      std::string mrow_i = mbase[ti];
+      std::string mrow_i = mbase;
       if (rowoff != 0)
         mrow_i = e.val("arith.addi " + mrow_i + ", " + C["c" + s(rowoff)] +
                        " : i32");
@@ -687,12 +879,15 @@ bool dense_gemm_shape_supported(const DenseGemmShape &shape) {
   if (shape.bm % 16 != 0 || shape.bn % 8 != 0 || shape.bk % 16 != 0)
     return false;
 #if defined(SONICBOOM_USE_ROCM)
-  // The AMD body is a grid of 16x16 WMMA tiles, 4 or 8 warps per block (one
-  // whole tile per warp slot, so the tiles must divide evenly) and at most 8
-  // accumulator tiles per lane (64 f32 registers).
+  // The AMD body is a grid of 16x16 WMMA tiles, 4 or 8 warps per block. A warp
+  // owns one 16-row strip and TPT tiles across the columns, so the strip count
+  // must divide the warp count, the tiles must divide evenly, and a lane holds
+  // at most 8 accumulator tiles (64 f32 registers).
   if (shape.bn % 16 != 0) return false;
-  const int tiles = (shape.bm / 16) * (shape.bn / 16);
+  const int mt = shape.bm / 16;
+  const int tiles = mt * (shape.bn / 16);
   const int warps = tiles >= 8 ? 8 : 4;
+  if (mt > warps || warps % mt != 0) return false;
   if (tiles % warps != 0 || tiles / warps > 8) return false;
   return dense_gemm_shared_bytes(shape) <= kAmdDenseGemmLdsBytes;
 #else
@@ -725,9 +920,12 @@ int dense_gemm_shared_bytes(const DenseGemmShape &shape) {
   const int row = shape.bk + 8;
 #if defined(SONICBOOM_USE_ROCM)
   // One staged slab each for W and X (see gemm_region_text_amd), rows padded to
-  // a 32-byte boundary so each WMMA fragment is one aligned LDS read.
+  // a 32-byte boundary so each WMMA fragment is one aligned LDS read. The slabs
+  // are double-buffered when both pairs fit, which the emitter decides with the
+  // same rule.
   const int arow = shape.bk + kAmdWmmaPad;
-  return (shape.bm * arow + shape.bn * arow) * 2;
+  const int pair = (shape.bm * arow + shape.bn * arow) * 2;
+  return 2 * pair <= kAmdDenseGemmLdsBytes ? 2 * pair : pair;
 #else
   // Double-buffered A and B stages, each row padded by 8 elements (see
   // gemm_region_text) so ldmatrix does not read every row from the same bank.
@@ -763,9 +961,11 @@ std::optional<std::string> generate_dense_gemm_hsaco(const DenseGemmShape &shape
 std::string dense_gemm_codegen_version() {
   // gemm2: padded shared staging (conflict-free ldmatrix); gemm3: scalar
   // scale epilogue (the folded `scale` consumer); gemm4: the AMD scalar body;
-  // gemm5: the AMD WMMA body (the version keys the disk cache for both
-  // backends).
-  return std::string("llvm-") + LLVM_VERSION_STRING + "-gemm5";
+  // gemm5: the AMD WMMA body; gemm6: 16-byte vectorised and fully unrolled
+  // AMD staging, double buffering where the LDS budget allows, one shared A
+  // fragment per warp and an XOR-swizzled LDS row layout (the version keys the
+  // disk cache for both backends).
+  return std::string("llvm-") + LLVM_VERSION_STRING + "-gemm6";
 }
 
 } // namespace sonicboom::compiler
