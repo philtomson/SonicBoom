@@ -403,6 +403,23 @@ if(SONICBOOM_USE_ROCM)
   sb_add_cpp_test(test_hip_attention_decode_codegen)
   set_tests_properties(test_hip_attention_decode_codegen
     PROPERTIES RESOURCE_LOCK gpu_vram)
+
+  # The generated prefill kernel on the ROCm backend: the AMD body is the
+  # scalar warp-per-row variant (the tensor-core body has no ROCDL lowering).
+  # Checks it against an fp64 reference and the hand-written warp kernel.
+  add_executable(test_hip_attention_prefill_codegen
+                 test_hip_attention_prefill_codegen.cpp)
+  target_link_libraries(test_hip_attention_prefill_codegen
+                        PRIVATE sonicboom sonicboom_compiler hip::host
+                                MLIRBuiltinToLLVMIRTranslation
+                                MLIRLLVMToLLVMIRTranslation)
+  target_link_options(test_hip_attention_prefill_codegen
+                      PRIVATE "-Wl,--exclude-libs,ALL")
+  target_compile_definitions(test_hip_attention_prefill_codegen
+                             PRIVATE SONICBOOM_USE_ROCM=1)
+  sb_add_cpp_test(test_hip_attention_prefill_codegen)
+  set_tests_properties(test_hip_attention_prefill_codegen
+    PROPERTIES RESOURCE_LOCK gpu_vram)
 endif()
 
 # Static execution planner tests (unit + integration). They include only

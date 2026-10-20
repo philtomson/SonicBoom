@@ -3624,6 +3624,10 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
     return true;
   }
 
+#if !defined(SONICBOOM_USE_ROCM)
+  // The tiled tensor-core kernels are CUDA-only (the body above is compiled
+  // out under ROCm, and the launcher returns false), so the HIP build goes
+  // straight to the scalar warp kernel below for every shape.
   if (gqa == 4 && head_dim == 256) {
     const bool ok = launch_tiled_flash_attention<256, 64, 2, 32, 4>(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
@@ -3651,6 +3655,7 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
                            sliding_window);
     return ok;
   }
+#endif
 
   const size_t smem = (size_t)n_heads_q * FA_BK * sizeof(float);
   SB_NOTE_LAUNCH(flash_attention_chunk_pos_kernel, n, n_heads_q * 32, smem, cur_stream());

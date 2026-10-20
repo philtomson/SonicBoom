@@ -63,6 +63,12 @@
 namespace sonicboom::compiler {
 namespace {
 
+// The AMD prefill body (see attention_prefill_region_text_amd) is
+// warp-per-row: four warps per block keeps the block small enough to fill the
+// 40-CU iGPU while still giving every warp at least two rows for the standard
+// br values (64 and 32).
+constexpr int kAmdPrefillThreads = 128;
+
 struct Emitter {
   std::string body;
   int next = 0;
@@ -1589,6 +1595,306 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
   return text;
 }
 
+// AMD prefill variant: the tensor-core body above is NVVM-shaped (`nvgpu`
+// ldmatrix/mma, `nvvm.cp.async`) and has no ROCDL lowering in this pipeline.
+// This body keeps the same kernel ABI and the same semantics (absolute key
+// positions, causal + sliding-window mask, batch/cache key split) but computes
+// q·k as a per-lane f32 fma chain reduced with the warp's butterfly
+// (`gpu.shuffle xor`) tree -- every lane needs the score -- and P·v as per-lane
+// f32 fma chains: one warp per query row, no shared memory, no barriers.
+// It is the functional fallback the plan calls for; MFMA-tiled attention is a
+// separate optimization.
+//
+// Row mapping: a block covers `br` query rows for one query head (grid y) and
+// each of the four warps takes every fourth row, so the geometry does not
+// depend on the tensor-core tile knobs (bc/dps/async_stages); `br` still sets
+// the grid, which keeps the region name and the cache key meaningful.
+std::string attention_prefill_region_text_amd(const AttentionShape &sh,
+                                              int sm_arch) {
+  const int D = sh.head_dim;
+  const int GQA = sh.gqa;
+  const int BR = sh.br;
+  const int K = D / 32;  // f32 output columns per lane
+  const int WARPS = kAmdPrefillThreads / 32;
+  const int RPW = (BR + WARPS - 1) / WARPS;  // rows per warp (strided)
+  const bool EXP2 = sh.exp2;
+
+  Emitter e;
+  std::map<std::string, std::string> C;
+  const auto s = [](int v) { return std::to_string(v); };
+  const auto c32 = [&](const char *n, int v) {
+    C[n] = e.val("arith.constant " + s(v) + " : i32");
+  };
+  const auto c64 = [&](const char *n, int v) {
+    C[n] = e.val("arith.constant " + s(v) + " : i64");
+  };
+  const auto cf = [&](const char *n, const char *v) {
+    C[n] = e.val(std::string("arith.constant ") + v + " : f32");
+  };
+  const auto ci = [&](const char *n, int v) {
+    C[n] = e.val("arith.constant " + s(v) + " : index");
+  };
+
+  e.op("gpu.func @fa(%q: !llvm.ptr, %kb: !llvm.ptr, %vb: !llvm.ptr, "
+       "%kc: !llvm.ptr, %vc: !llvm.ptr, %startp: !llvm.ptr, %nslots: i64, "
+       "%nhq: i32, %nhkv: i32, %n: i32, %window: i64, %scale: f32, "
+       "%out: !llvm.ptr) kernel {");
+  c32("c0", 0); c32("c1", 1); c32("c4", 4); c32("c5", 5); c32("c7", 7);
+  c32("c31", 31); c32("c32", 32);
+  c64("l0", 0); c64("l1", 1); c64("lD", D); c64("lbr", BR);
+  cf("cf0", "0.0"); cf("cneg", "-1.0e+30"); cf("cone", "1.0");
+  ci("x0", 0); ci("x1", 1); ci("xw", WARPS); ci("xrpw", RPW);
+  if (GQA != 4 && GQA != 7) c32("gqa", GQA);
+
+  std::string scl = "%scale";
+  if (EXP2) {
+    cf("clog2e", "1.44269502e+00");
+    scl = e.val("arith.mulf %scale, " + C["clog2e"] + " : f32");
+  }
+
+  const std::string tid = e.val("gpu.thread_id x");
+  const std::string bx = e.val("gpu.block_id x");
+  const std::string by = e.val("gpu.block_id y");
+  const std::string tid_i = e.val("arith.index_cast " + tid + " : index to i32");
+  const std::string bx_i = e.val("arith.index_cast " + bx + " : index to i32");
+  const std::string by_i = e.val("arith.index_cast " + by + " : index to i32");
+  const std::string lane =
+      e.val("arith.andi " + tid_i + ", " + C["c31"] + " : i32");
+  const std::string lane64 = e.val("arith.extsi " + lane + " : i32 to i64");
+  const std::string warp =
+      e.val("arith.shrui " + tid_i + ", " + C["c5"] + " : i32");
+  const std::string warp_i = e.val("arith.index_cast " + warp + " : i32 to index");
+  const std::string bx64 = e.val("arith.extsi " + bx_i + " : i32 to i64");
+  const std::string by64 = e.val("arith.extsi " + by_i + " : i32 to i64");
+  const std::string nhq64 = e.val("arith.extui %nhq : i32 to i64");
+  const std::string nhkv64 = e.val("arith.extui %nhkv : i32 to i64");
+  const std::string n64 = e.val("arith.extsi %n : i32 to i64");
+  const std::string start = e.val("llvm.load %startp : !llvm.ptr -> i64");
+  const std::string div = GQA == 7 ? C["c7"] : GQA == 4 ? C["c4"] : C["gqa"];
+  const std::string hkv = e.val("arith.divui " + by_i + ", " + div + " : i32");
+  const std::string hkv64 = e.val("arith.extui " + hkv + " : i32 to i64");
+  const std::string hq64 = by64;
+  const std::string bxbr = e.val("arith.muli " + bx64 + ", " + C["lbr"] + " : i64");
+
+  // One row per warp per iteration; a warp's rows are strided by the warp
+  // count so the mapping works for any br.
+  e.op("scf.for %ri = " + C["x0"] + " to " + C["xrpw"] + " step " + C["x1"] +
+       " : index {");
+  {
+    const std::string rw = e.val("arith.muli %ri, " + C["xw"] + " : index");
+    const std::string roff = e.val("arith.addi " + rw + ", " + warp_i +
+                                   " : index");
+    const std::string roff64 = e.val("arith.index_cast " + roff +
+                                     " : index to i64");
+    const std::string row = e.val("arith.addi " + bxbr + ", " + roff64 +
+                                  " : i64");
+    const std::string ok = e.val("arith.cmpi slt, " + row + ", " + n64 +
+                                 " : i64");
+    e.op("scf.if " + ok + " {");
+    {
+      const std::string p = e.val("arith.addi " + start + ", " + row +
+                                  " : i64");
+      // Valid key window [low, p]: the query row itself is always a key.
+      std::string low = C["l0"];
+      if (sh.window_mask) {
+        const std::string hasw =
+            e.val("arith.cmpi sgt, %window, " + C["l0"] + " : i64");
+        const std::string big =
+            e.val("arith.cmpi sge, " + p + ", %window : i64");
+        const std::string ws = e.val("arith.subi " + p + ", %window : i64");
+        const std::string ws1 = e.val("arith.addi " + ws + ", " + C["l1"] +
+                                      " : i64");
+        const std::string cond = e.val("arith.andi " + hasw + ", " + big +
+                                       " : i1");
+        low = e.val("arith.select " + cond + ", " + ws1 + ", " + C["l0"] +
+                    " : i64");
+      }
+
+      // Q row: q[(row * nhq + hq) * D + d], d = lane + 32 i.
+      const std::string qr = e.val("arith.muli " + row + ", " + nhq64 +
+                                   " : i64");
+      const std::string qrh = e.val("arith.addi " + qr + ", " + hq64 + " : i64");
+      const std::string qbase = e.val("arith.muli " + qrh + ", " + C["lD"] +
+                                      " : i64");
+      const std::string ql = e.val("arith.addi " + qbase + ", " + lane64 +
+                                   " : i64");
+      std::vector<std::string> qv(K);
+      for (int i = 0; i < K; ++i) {
+        std::string off = ql;
+        if (i != 0)
+          off = e.val("arith.addi " + ql + ", " + e.val("arith.constant " +
+                                                         s(32 * i) + " : i64") +
+                      " : i64");
+        const std::string qp = e.val("llvm.getelementptr %q[" + off +
+                                     "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+        qv[i] = e.val("llvm.load " + qp + " : !llvm.ptr -> f32");
+      }
+
+      const std::string jlo_i = e.val("arith.index_cast " + low +
+                                      " : i64 to index");
+      const std::string pend = e.val("arith.addi " + p + ", " + C["l1"] +
+                                     " : i64");
+      const std::string jhi_i = e.val("arith.index_cast " + pend +
+                                      " : i64 to index");
+      // Cache slot of the first key; later slots are the predecessor + 1 so
+      // the loop carries no device division.
+      const std::string slot0 = e.val("arith.remui " + low + ", %nslots : i64");
+
+      std::vector<std::string> names, init, types;
+      for (int i = 0; i < K; ++i) {
+        names.push_back("%o" + s(i));
+        init.push_back(C["cf0"]);
+        types.push_back("f32");
+      }
+      names.push_back("%m"); init.push_back(C["cneg"]); types.push_back("f32");
+      names.push_back("%l"); init.push_back(C["cf0"]); types.push_back("f32");
+      names.push_back("%slot"); init.push_back(slot0); types.push_back("i64");
+      std::string ia = "iter_args(", ty = " -> (", loopres;
+      for (size_t i = 0; i < names.size(); ++i) {
+        ia += (i ? ", " : "") + names[i] + " = " + init[i];
+        ty += (i ? ", " : "") + types[i];
+        loopres += (i ? ", " : "") + std::string("%r") + s(int(i));
+      }
+      ia += ")";
+      ty += ")";
+      e.op(loopres + " = scf.for %j = " + jlo_i + " to " + jhi_i + " step " +
+           C["x1"] + " " + ia + ty + " {");
+      {
+        std::map<std::string, std::string> iv;
+        for (size_t i = 0; i < names.size(); ++i) iv[names[i]] = names[i];
+        const std::string j64 = e.val("arith.index_cast %j : index to i64");
+        const std::string isc =
+            e.val("arith.cmpi slt, " + j64 + ", " + start + " : i64");
+        // Key row base for both sources: cache by slot, batch by (j - start).
+        const std::string co1 = e.val("arith.muli %slot, " + nhkv64 + " : i64");
+        const std::string co2 = e.val("arith.addi " + co1 + ", " + hkv64 +
+                                      " : i64");
+        const std::string co3 = e.val("arith.muli " + co2 + ", " + C["lD"] +
+                                      " : i64");
+        const std::string cb = e.val("arith.addi " + co3 + ", " + lane64 +
+                                     " : i64");
+        const std::string bi = e.val("arith.subi " + j64 + ", " + start +
+                                     " : i64");
+        const std::string bo1 = e.val("arith.muli " + bi + ", " + nhkv64 +
+                                      " : i64");
+        const std::string bo2 = e.val("arith.addi " + bo1 + ", " + hkv64 +
+                                      " : i64");
+        const std::string bo3 = e.val("arith.muli " + bo2 + ", " + C["lD"] +
+                                      " : i64");
+        const std::string bb = e.val("arith.addi " + bo3 + ", " + lane64 +
+                                     " : i64");
+        const auto at = [&](const char *ptr, const std::string &base, int i) {
+          std::string off = base;
+          if (i != 0)
+            off = e.val("arith.addi " + base + ", " +
+                        e.val("arith.constant " + s(32 * i) + " : i64") +
+                        " : i64");
+          return e.val(std::string("llvm.getelementptr %") + ptr + "[" + off +
+                       "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+        };
+        const auto load_keyed = [&](const char *cache_ptr, const char *batch_ptr,
+                                    int i) {
+          const std::string cp = at(cache_ptr, cb, i);
+          const std::string bp = at(batch_ptr, bb, i);
+          const std::string rp = e.val("llvm.select " + isc + ", " + cp + ", " +
+                                       bp + " : i1, !llvm.ptr");
+          return e.val("llvm.load " + rp + " : !llvm.ptr -> f32");
+        };
+
+        // q·k: lane-strided fma chain, then a butterfly (xor) reduction.
+        // Unlike the decode kernel, every lane needs the score -- it drives
+        // this lane's softmax state and its own P·V columns -- and a
+        // shuffle-down tree leaves only lane 0 with the full sum.
+        std::string dot = C["cf0"];
+        for (int i = 0; i < K; ++i)
+          dot = e.val("llvm.intr.fma(" + qv[i] + ", " +
+                      load_keyed("kc", "kb", i) + ", " + dot +
+                      ") : (f32, f32, f32) -> f32");
+        for (int d = 16; d > 0; d >>= 1) {
+          const std::string c = e.val("arith.constant " + s(d) + " : i32");
+          const std::string sh =
+              e.val2("gpu.shuffle xor " + dot + ", " + c + ", " + C["c32"] +
+                     " : f32").first;
+          dot = e.val("arith.addf " + dot + ", " + sh + " : f32");
+        }
+        const std::string sc = e.val("arith.mulf " + dot + ", " + scl +
+                                     " : f32");
+        const std::string mn = e.val("arith.maximumf " + iv["%m"] + ", " + sc +
+                                     " : f32");
+        const std::string da = e.val("arith.subf " + iv["%m"] + ", " + mn +
+                                     " : f32");
+        const std::string alpha =
+            e.val(std::string(EXP2 ? "math.exp2 " : "math.exp ") + da +
+                  " : f32");
+        const std::string dp = e.val("arith.subf " + sc + ", " + mn + " : f32");
+        const std::string pe =
+            e.val(std::string(EXP2 ? "math.exp2 " : "math.exp ") + dp +
+                  " : f32");
+        iv["%m"] = mn;
+        const std::string lr = e.val("arith.mulf " + iv["%l"] + ", " + alpha +
+                                     " : f32");
+        iv["%l"] = e.val("arith.addf " + lr + ", " + pe + " : f32");
+        for (int i = 0; i < K; ++i) {
+          const std::string a0 = e.val("arith.mulf " + iv["%o" + s(i)] + ", " +
+                                       alpha + " : f32");
+          iv["%o" + s(i)] =
+              e.val("llvm.intr.fma(" + pe + ", " + load_keyed("vc", "vb", i) +
+                    ", " + a0 + ") : (f32, f32, f32) -> f32");
+        }
+        const std::string sp1 = e.val("arith.addi %slot, " + C["l1"] +
+                                      " : i64");
+        const std::string full = e.val("arith.cmpi eq, " + sp1 +
+                                       ", %nslots : i64");
+        iv["%slot"] = e.val("arith.select " + full + ", " + C["l0"] + ", " +
+                            sp1 + " : i64");
+        std::string y = "scf.yield ", t;
+        for (size_t i = 0; i < names.size(); ++i) {
+          y += (i ? ", " : "") + iv[names[i]];
+          t += (i ? ", " : "") + types[i];
+        }
+        e.op(y + " : " + t);
+      }
+      e.op("}");
+
+      // Normalize (l > 0: the query's own key is always in the window) and
+      // store to out[(row * nhq + hq) * D + d].
+      // Loop results: %r0..%r<K-1> are O, then m, then l, then slot.
+      const std::string inv = e.val("arith.divf " + C["cone"] + ", %r" +
+                                    s(K + 1) + " : f32");
+      const std::string orow = e.val("arith.muli " + row + ", " + nhq64 +
+                                     " : i64");
+      const std::string orh = e.val("arith.addi " + orow + ", " + hq64 +
+                                    " : i64");
+      const std::string obase = e.val("arith.muli " + orh + ", " + C["lD"] +
+                                      " : i64");
+      const std::string ol = e.val("arith.addi " + obase + ", " + lane64 +
+                                   " : i64");
+      for (int i = 0; i < K; ++i) {
+        const std::string y = e.val("arith.mulf %r" + s(i) + ", " + inv +
+                                    " : f32");
+        std::string off = ol;
+        if (i != 0)
+          off = e.val("arith.addi " + ol + ", " + e.val("arith.constant " +
+                                                        s(32 * i) + " : i64") +
+                      " : i64");
+        const std::string op = e.val("llvm.getelementptr %out[" + off +
+                                     "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+        e.op("llvm.store " + y + ", " + op + " : f32, !llvm.ptr");
+      }
+    }
+    e.op("}");
+  }
+  e.op("}");
+  e.op("gpu.return");
+  e.op("}");
+
+  std::string text = "module attributes {gpu.container_module} {\n";
+  text += "  gpu.module @fa [#nvvm.target<chip = \"sm_" + s(sm_arch) + "\">] {\n";
+  text += e.body;
+  text += "  }\n}\n";
+  return text;
+}
+
 } // namespace
 
 bool attention_shape_supported(const AttentionShape &shape) {
@@ -1607,6 +1913,11 @@ bool attention_shape_supported(const AttentionShape &shape) {
     return shape.head_dim % 32 == 0 && shape.head_dim / 32 <= 16 &&
            shape.head_dim <= 1024;
   }
+#if defined(SONICBOOM_USE_ROCM)
+  // The AMD prefill body is warp-per-row: one f32 lane slot per head_dim/32.
+  // The tensor-core tile knobs are irrelevant to it.
+  if (shape.head_dim % 32 != 0 || shape.head_dim / 32 > 16) return false;
+#endif
   if (shape.warp_head) {
     // One warp per (query head, 16-row chunk), whole head_dim per warp: the
     // lane's f32 output accumulator is head_dim/2 registers (at most 128), the
@@ -1634,13 +1945,26 @@ bool attention_shape_supported(const AttentionShape &shape) {
 
 int attention_block_threads(const AttentionShape &shape) {
   if (shape.decode) return 32;  // one warp for the partial kernel
+#if defined(SONICBOOM_USE_ROCM)
+  // The AMD prefill body is the scalar warp-per-row variant: a fixed four-warp
+  // block, independent of the tensor-core tile knobs.
+  (void)shape;
+  return kAmdPrefillThreads;
+#else
   if (shape.warp_head) return shape.gqa * 32;  // one warp per query head
   return (shape.br / 16) * shape.dps * 32;
+#endif
 }
 
 int attention_shared_bytes(const AttentionShape &shape) {
   // Decode: the fixed score view the partial kernel stages the chunk in.
   if (shape.decode) return 4 * kAttentionDecodeMaxChunk;
+#if defined(SONICBOOM_USE_ROCM)
+  // The AMD prefill body keeps Q/O in registers and K/V read straight from
+  // global memory: no shared memory at all.
+  (void)shape;
+  return 0;
+#else
   const int qrows = shape.warp_head ? shape.gqa * shape.br : shape.br;
   // Every f16 tile row carries the 8-element bank-conflict pad (see
   // attention_region_text).
@@ -1659,6 +1983,7 @@ int attention_shared_bytes(const AttentionShape &shape) {
                            shape.head_dim * 4
                      : 0;
   return q + k + v + sp + (ab <= q ? 0 : ab);
+#endif
 }
 
 std::optional<std::string> generate_attention_ptx(const AttentionShape &shape,
@@ -1701,7 +2026,16 @@ std::optional<std::string> generate_attention_hsaco(const AttentionShape &shape,
     return lower_gpu_module_to_hsaco(adapted, /*link_libdevice=*/true,
                                      "attention");
   }
+#if defined(SONICBOOM_USE_ROCM)
+  // The NVIDIA prefill body is tensor-core MLIR (nvgpu/mma, nvvm.cp.async) and
+  // cannot be lowered to ROCDL; the AMD path emits the scalar warp-per-row
+  // variant instead. A warp-head pin has no AMD body (grid y would be the KV
+  // head, which the scalar kernel does not implement), so it falls back.
+  if (shape.warp_head) return std::nullopt;
+  const std::string text = attention_prefill_region_text_amd(shape, gfx_arch);
+#else
   const std::string text = attention_region_text(shape, gfx_arch);
+#endif
   const AmdKernelBlock block{kAttentionKernelEntry,
                              attention_block_threads(shape)};
   const std::string adapted =
@@ -1712,6 +2046,9 @@ std::optional<std::string> generate_attention_hsaco(const AttentionShape &shape,
 }
 
 std::string attention_codegen_version() {
+  // attn10: the AMD prefill body is the scalar warp-per-row variant (butterfly
+  // q·k reduction, per-key online softmax, no shared memory); the NVIDIA body
+  // is unchanged, but the version keys the disk cache for both builds.
   // attn9: the generated prefill kernel's per-row softmax sum uses the
   // hand-written tiled kernel's left-to-right association (and the l update
   // is fused like the reference's `l*rs + sum`), so the d64 prefill output is
@@ -1725,7 +2062,7 @@ std::string attention_codegen_version() {
   // wavefronts); attn5: cp.async K/V staging pipeline (f32 prefetch buffers
   // converted to the f16 mma tiles in shared memory); attn4: warp-head
   // variant (S and P stay in registers; br fixed at 16).
-  return std::string("llvm-") + LLVM_VERSION_STRING + "-attn9";
+  return std::string("llvm-") + LLVM_VERSION_STRING + "-attn10";
 }
 
 } // namespace sonicboom::compiler

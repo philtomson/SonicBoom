@@ -3,8 +3,7 @@
 Status: **active** — Phase 0-2 complete (branch `amd_dev`), Phase 4 under way
 (vendor-neutral device gate + vendor-neutral device/backend IDs landed; the
 per-op and device-resident forward paths run on AMD), Phase 3 started
-(generated decode attention runs on AMD; prefill attention and the dense GEMM
-are open).
+(generated decode and prefill attention run on AMD; the dense GEMM is open).
 `origin/master` merged in
 (bb8e43f): upstream's training/backward work is CUDA-gated in its host files,
 so the ROCm build takes it as host-only code; two conflicts (NVTX include,
@@ -222,12 +221,46 @@ skips when no AMD device is present).
       d512/1024 keys 26.1 vs 107.9. The hand-written pair's blocks share a KV
       group across query heads but expose far fewer blocks; on the 40-CU iGPU
       the generated one-warp-per-(head, chunk) grid wins.
-- [ ] Prefill `fa` on AMD: the emitted body is tensor-core (`nvgpu.ldmatrix` /
-      `nvgpu.mma.sync` / `nvvm.cp.async`, f16 staging). Emit a non-tensor-core
-      thread-partitioned variant (scalar f32 fma loops, no ldmatrix/mma/cp.async)
-      for `generate_attention_hsaco`; the HIP prefill caller
-      (`nn/hip_elementwise.hip:3606`) stays on the hand-written tiled kernel
-      until its numerics/perf justify switching.
+- [x] **Generated prefill attention (the `fa` region) runs on AMD.** The
+      NVIDIA body is tensor-core (`nvgpu.ldmatrix` / `nvgpu.mma.sync` /
+      `nvvm.cp.async`, f16 staging) and has no ROCDL lowering, so
+      `AttentionCodegen.cpp` now has two emitters behind one ABI:
+      `attention_region_text` (unchanged) on CUDA and
+      `attention_prefill_region_text_amd` on ROCm. The AMD body is scalar f32:
+      four warps per block, one query row per warp, `RPW = ceil(br/4)` rows per
+      block, a per-key loop with a lane-strided fma dot and a **butterfly
+      (`gpu.shuffle xor`) reduction** — unlike decode, every lane needs the
+      score for its own softmax state and P·V columns, so a shuffle-down tree
+      is wrong here (it was caught by the test immediately) — then online
+      softmax (`math.exp`, fma) and the same masked key range, batch/cache
+      `llvm.select` and slot wrap as the CUDA body. No LDS and no barriers:
+      `attention_shared_bytes` returns 0, `attention_block_threads` 128 for
+      prefill (decode stays 32), and `attention_shape_supported` accepts any
+      `head_dim` that is a multiple of the wave (32) up to 16 elements per
+      lane. A warp-head pin is rejected (falls back to the hand-written
+      kernel). The same text retargets through `amdgpu_adapt_module_text` and
+      the ROCDL pipeline as the decode pair. The HIP caller
+      (`nn/hip_elementwise.hip`) previously never reached any generated prefill
+      kernel: `launch_tiled_flash_attention` returns false on ROCm and the
+      attempts were not guarded, so d256/d512 prefill silently fell through to
+      the hand-written scalar kernel while d64 returned nothing. Those
+      attempts are now `#if !defined(SONICBOOM_USE_ROCM)`, so all shapes take
+      the scalar path.
+      `tests/core/test_hip_attention_prefill_codegen.cpp` runs the real
+      `nn::cuda::flash_attention_chunk_dev_pos` entry with
+      `SONICBOOM_ATTN_IMPL=codegen` (d256 window short/full, d256 causal and
+      slot wrap, d512, d64 GQA 7), checks the fp64 reference, requires the
+      generated error to be no worse than 2× the hand-written scalar kernel's,
+      asserts determinism and probes the `.hsaco` cache for the `fa` entry.
+      Numerics land at 1.1–2.8e-5 relative, the same class as the hand-written
+      kernel. Full suite 89/89, 5 expected skips.
+      Perf is not benchmarked and no default is forced: the only ROCm prefill
+      alternative is the hand-written scalar warp kernel, which does the same
+      work with the same grid granularity, and the CUDA tiled kernel (the one
+      the old note compared against) does not exist on ROCm. d256/d512 keep
+      their static `Codegen` default, d64 keeps `Own`; because
+      `attn_launch_own` now works on ROCm, the runtime tuner can compare both
+      when `SONICBOOM_ATTN_CODEGEN` is on.
 - [ ] Dense bf16 GEMM on AMD: same treatment for `GemmCodegen` (the CUDA body
       is mma/cp.async); `launch_dense_gemm` still returns false on ROCm.
 - [ ] Optimize later: `MFMA` (fp16 `MFMA_F32_16x16x16_F16`),

@@ -100,6 +100,16 @@ set_target_properties(sonicboom_compiler PROPERTIES POSITION_INDEPENDENT_CODE ON
 # dialect uses dynamic_cast or typeid.
 target_compile_options(sonicboom_compiler PRIVATE -fno-rtti)
 
+# The code emitters are target-specific: generate_attention_hsaco must emit a
+# body the ROCDL pipeline can lower, and its shape support/block geometry
+# follow the same switch. Keep this in lockstep with the runtime's backend
+# definition (core/CMakeLists.txt).
+if(SONICBOOM_USE_CUDA)
+  target_compile_definitions(sonicboom_compiler PRIVATE SONICBOOM_USE_CUDA=1)
+elseif(SONICBOOM_USE_ROCM)
+  target_compile_definitions(sonicboom_compiler PRIVATE SONICBOOM_USE_ROCM=1)
+endif()
+
 add_dependencies(sonicboom_compiler boom_incgen)
 
 # PUBLIC: the dialect's public headers (BoomDialect.h, BoomTypes.h, BoomOps.h)
