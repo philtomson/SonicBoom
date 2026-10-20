@@ -196,29 +196,44 @@ add_test(NAME test_qwen2_generate_decode_chunk
 set_tests_properties(test_qwen2_generate_decode_chunk
   PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram)
 
-# Real GPU closed-loop test. Only built when the CUDA build is enabled; at
-# runtime it skips cleanly (exit 0) when no CUDA device is present.
-if(SONICBOOM_USE_CUDA)
+# Real GPU closed-loop test. Only built when the CUDA or ROCm/HIP build is
+# enabled; at runtime it skips cleanly (exit 0) when no such device is present.
+# The differential suites call the nn::cuda::* / quant::cuda::* entry points,
+# which on a ROCm build are the HIP twins (same namespace, same contract).
+if(SONICBOOM_USE_CUDA OR SONICBOOM_USE_ROCM)
   add_executable(test_cuda test_cuda.cpp)
   target_link_libraries(test_cuda PRIVATE sonicboom)
   sb_add_cpp_test(test_cuda)
 
-  # CUDA K-quant matvec differential test (CUDA gemv vs scalar CPU reference).
+  # CUDA/HIP K-quant matvec differential test (device gemv vs scalar CPU reference).
   add_executable(test_cuda_quant test_cuda_quant.cpp)
   target_link_libraries(test_cuda_quant PRIVATE sonicboom)
+  if(SONICBOOM_USE_ROCM)
+    # The MMQ/cuBLAS-only assertions are gated out on ROCm (not yet ported).
+    target_compile_definitions(test_cuda_quant PRIVATE SONICBOOM_USE_ROCM=1)
+  endif()
   sb_add_cpp_test(test_cuda_quant)
 
-  # CUDA single-row gather differential test (device gather vs dequantize_row_f32).
+  # CUDA/HIP single-row gather differential test (device gather vs dequantize_row_f32).
   add_executable(test_cuda_gather test_cuda_gather.cpp)
   target_link_libraries(test_cuda_gather PRIVATE sonicboom)
   sb_add_cpp_test(test_cuda_gather)
 
-  # CUDA elementwise/norm/RoPE/dense-matvec differential test (each nn::cuda::*
-  # kernel vs its CPU reference).
+  # CUDA/HIP elementwise/norm/RoPE/dense-matvec differential test (each
+  # nn::cuda::* kernel vs its CPU reference).
   add_executable(test_cuda_elementwise test_cuda_elementwise.cpp)
   target_link_libraries(test_cuda_elementwise PRIVATE sonicboom)
   sb_add_cpp_test(test_cuda_elementwise)
 
+  # Small, but still GPU tests: they run one at a time on the GPU.
+  set_tests_properties(test_cuda test_cuda_quant test_cuda_gather
+                       test_cuda_elementwise
+    PROPERTIES RESOURCE_LOCK gpu_vram)
+endif()
+
+# Compiler-generated kernel tests (MLIR -> NVVM -> PTX codegen + CUDA driver JIT).
+# These are CUDA-only; the ROCm codegen path (Phase 2) is a separate effort.
+if(SONICBOOM_USE_CUDA)
   # Compiler-generated glue kernel (Stage 5): the MLIR -> NVVM -> PTX pipeline
   # and the driver JIT, byte-compared with the hand-written kernel the region
   # replaces. Links the compiler library for generate_glue_ptx and the CUDA
@@ -290,6 +305,32 @@ if(SONICBOOM_USE_CUDA)
                        test_cuda_attention_decode_codegen
                        test_cuda_dense_gemm_codegen
     PROPERTIES RESOURCE_LOCK gpu_vram)
+endif()
+
+# Compiler-generated kernel test, ROCm/AMDGPU twin (MLIR -> ROCDL -> HSACO
+# codegen + HIP module JIT). Same coverage intent as test_glue_codegen, on the
+# ROCm codegen path: every glue region compiles to an HSA code object, loads
+# through hipModuleLoadData, and launches with its ABI.
+if(SONICBOOM_USE_ROCM)
+  add_executable(test_glue_hsaco test_glue_hsaco.cpp)
+  # sonicboom_compiler carries its MLIR/LLVM deps PRIVATE (as test_boom_conversion
+  # does), so the two dialect translations generate_glue_hsaco uses at run time
+  # (the ROCDL target serialization reaches the builtin and llvm.dialect
+  # translations) are named here.
+  target_link_libraries(test_glue_hsaco PRIVATE sonicboom sonicboom_compiler
+                                                  hip::host
+                                                  MLIRBuiltinToLLVMIRTranslation
+                                                  MLIRLLVMToLLVMIRTranslation)
+  # Like the core itself: this executable statically links the project LLVM (in
+  # sonicboom_compiler) and, through hip::host, ends up loading ROCm's own
+  # libLLVM/libclang-cpp. Exporting the project LLVM symbols from the executable
+  # lets libclang-cpp interpose onto the v23 pass manager during the ROCm
+  # runtime's code-object JIT, which segfaults on the ABI mismatch. Hide the
+  # static-library symbols so each side keeps its own LLVM.
+  target_link_options(test_glue_hsaco PRIVATE "-Wl,--exclude-libs,ALL")
+  target_compile_definitions(test_glue_hsaco PRIVATE SONICBOOM_USE_ROCM=1)
+  sb_add_cpp_test(test_glue_hsaco)
+  set_tests_properties(test_glue_hsaco PROPERTIES RESOURCE_LOCK gpu_vram)
 endif()
 
 # Static execution planner tests (unit + integration). They include only

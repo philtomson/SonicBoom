@@ -191,6 +191,42 @@ if(SONICBOOM_USE_CUDA)
     PROPERTIES COMPILE_OPTIONS "-extended-lambda")
 endif()
 
+# ROCm / HIP: mirrors the CUDA block. Defines the adapter's build-time switch
+# (guards hip_available() and the HIP tensor factory in core/layer1/adapter)
+# and links the HIP runtime. Kernel sources are the `.hip` twins of the `.cu`
+# files; the host-only HIP orchestration (hip_* backend/block) is added here
+# with the same glob-exclusion pattern as the CUDA files.
+if(SONICBOOM_USE_ROCM)
+  target_compile_definitions(sonicboom PRIVATE SONICBOOM_USE_ROCM=1)
+  target_link_libraries(sonicboom PRIVATE hip::host)
+  # The ROCm HIP runtime (libamdhip64) pulls in ROCm's own libLLVM/libclang-cpp
+  # via libamd_comgr. The core also statically links the project LLVM (for the
+  # MLIR path); exporting both sets of LLVM symbols lets one interpose onto the
+  # other (v23 vs v24), which corrupts the heap (clang option-parse failures +
+  # double-free). Hide symbols from static libraries so the project LLVM and
+  # native-torch stay internal; the public core/C-API symbols (compiled from
+  # source objects, not static libs) remain exported.
+  target_link_options(sonicboom PRIVATE "-Wl,--exclude-libs,ALL")
+  # The HIP language compilation does not inherit hip::host's INTERFACE include
+  # dirs the way C++ does; pull the ROCm include root onto the target explicitly
+  # so .hip TUs see hip/hipblas/rocblas headers. The root is derived from the
+  # HIP compiler location (lib/llvm/bin/clang++ -> <rocm-root>).
+  get_filename_component(_sb_hip_bin "${CMAKE_HIP_COMPILER}" DIRECTORY)
+  get_filename_component(_sb_rocm_root "${_sb_hip_bin}/../../.." ABSOLUTE)
+  # target_include_directories propagates to C++ but not to the HIP language
+  # flags.make here; add the ROCm include root explicitly to HIP compilations.
+  target_compile_options(sonicboom PRIVATE
+    $<$<COMPILE_LANGUAGE:HIP>:-I${_sb_rocm_root}/include>)
+  # HIP kernel sources (the `.hip` twins of the `.cu` files) are added here as
+  # they are ported. The host-only HIP orchestration files also go in this
+  # block with the same glob-exclusion pattern as their CUDA twins.
+  target_sources(sonicboom PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/hip_elementwise.hip
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/quant/hip_quant_matmul.hip
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/planner/sonic_cuda_backend.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/model/cuda_block.cpp)
+endif()
+
 # Vulkan backend stub (Step 3): pure C++23, no Vulkan loader. OFF by default;
 # building with SONICBOOM_USE_VULKAN=ON compiles the zero-kernel scaffold that
 # backend authors use as a template (see design/backend-author-guide.md).

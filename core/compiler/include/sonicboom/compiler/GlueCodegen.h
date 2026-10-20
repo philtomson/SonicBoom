@@ -127,6 +127,14 @@ constexpr int kGeluMulBlockThreads = 256;
 // generator, the module fails to verify, or the downstream lowering fails.
 std::optional<std::string> generate_glue_ptx(GlueRegionKind kind, int sm_arch);
 
+// Generate the region's HSA code object (HSACO) for an AMDGPU chip `gfx_arch`
+// (e.g. 1151 = gfx1151). This is the ROCm twin of generate_glue_ptx: the same
+// region text is lowered through the ROCDL dialect and serialized by the
+// AMDGPU backend (which needs the ROCm toolkit's lld for the final link). Returns nullopt on any failure (the planner falls back to the
+// hand-written kernels). Only meaningful on a ROCm build; on a CUDA-only build
+// it returns nullopt.
+std::optional<std::string> generate_glue_hsaco(GlueRegionKind kind, int gfx_arch);
+
 // Lower a textual GPU-dialect module (a container module holding one
 // gpu.module) to PTX assembly through the NVVM pipeline above. `link_libdevice`
 // converts math ops through libdevice and links it, for kernels that use exp /

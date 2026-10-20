@@ -53,9 +53,17 @@
 
 #pragma once
 
+#if defined(__HIPCC__)
+#include <hip/hip_runtime.h>
+#include "../hip_intrinsics.h"
+#else
 #include <cuda_runtime.h>
 #include <sm_32_intrinsics.h>  // __vsub4
 #include <sm_61_intrinsics.h>  // __dp4a
+// The bodies below are in the hipify spelling (hipThreadIdx_x, hipBlockIdx_y,
+// …); this maps those names onto the CUDA runtime for the nvcc build.
+#include "../hip_compat.h"
+#endif
 
 #include <cstdint>
 
@@ -137,14 +145,14 @@ inline constexpr int kQuantizeWarpsPerBlock = kQuantizeBlockThreads / 32;
 // old one-thread-per-block mapping) short instead of latency-bound.
 __global__ void quantize_q8_1(const float* __restrict__ x,
                               block_q8_1* __restrict__ y, int nblocks) {
-  const int ib = blockIdx.x * kQuantizeWarpsPerBlock + (threadIdx.x >> 5);
+  const int ib = hipBlockIdx_x * kQuantizeWarpsPerBlock + (hipThreadIdx_x >> 5);
   if (ib >= nblocks) return;
-  const int lane = threadIdx.x & 31;
+  const int lane = hipThreadIdx_x & 31;
   const float xi = x[(size_t)ib * 32 + lane];
   float amax = fabsf(xi);
   #pragma unroll
   for (int off = 16; off > 0; off >>= 1)
-    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffffffffffull, amax, off));
   const float d = amax / 127.0f;
   if (lane == 0) y[ib].d = d;
   y[ib].qs[lane] = (d == 0.0f) ? int8_t(0) : int8_t(roundf(xi / d));
@@ -177,14 +185,14 @@ __device__ __forceinline__ float vec_dot_q3_K_q8_1(const uint8_t* wb,
   // from its group via __shfl. Bit-identical to the stock unpack (same integer
   // sc values, same dot accumulation order); it only removes redundant ALU work
   // from the instruction/compute-bound Q3_K kernel.
-  const int lane = threadIdx.x;                            // 0..31
+  const int lane = hipThreadIdx_x;                            // 0..31
   const int group_base = (lane >> 4) << 4;                 // 0 or 16
   const int my_sc = ((scales[iqs & 7] >> (4 * (iqs >> 3))) & 0xF)
                   | (((scales[8 + (iqs & 3)] >> (2 * (iqs >> 2))) & 3) << 4);
   int sc[QR3_K];
   #pragma unroll
   for (int i = 0; i < QR3_K; ++i)
-    sc[i] = __shfl_sync(0xffffffffu, my_sc, group_base + scale_offset + 2 * i);
+    sc[i] = __shfl_sync(0xffffffffffffffffull, my_sc, group_base + scale_offset + 2 * i);
 
   const int vl = get_int_b2(qs, iqs);
   const int vh = ~get_int_b2(hmask, iqs % (QI3_K / 2)) >> bq8_offset;
@@ -422,8 +430,8 @@ __global__ void gemv_q3_K_q8_1(const uint8_t* __restrict__ w,
                                float* __restrict__ dst, int blocks_per_row,
                                int num_rows, const float* __restrict__ bias,
                                const float* __restrict__ add) {
-  const int lane = threadIdx.x;
-  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  const int lane = hipThreadIdx_x;
+  const int row = hipBlockIdx_y * hipBlockDim_y + hipThreadIdx_y;
   if (row >= num_rows) return;
   const int iqs = lane & 15;   // QI3_K=16 slices
   const int ib = lane >> 4;    // 2 blocks per warp
@@ -434,7 +442,7 @@ __global__ void gemv_q3_K_q8_1(const uint8_t* __restrict__ w,
     sum += vec_dot_q3_K_q8_1(wb, yb, iqs);
   }
   #pragma unroll
-  for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, o);
+  for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffffffffffffull, sum, o);
   if (lane == 0) {
     float v = sum;
     if (bias) v += bias[row];
@@ -448,8 +456,8 @@ __global__ void gemv_q4_K_q8_1(const uint8_t* __restrict__ w,
                                float* __restrict__ dst, int blocks_per_row,
                                int num_rows, const float* __restrict__ bias,
                                const float* __restrict__ add) {
-  const int lane = threadIdx.x;
-  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  const int lane = hipThreadIdx_x;
+  const int row = hipBlockIdx_y * hipBlockDim_y + hipThreadIdx_y;
   if (row >= num_rows) return;
   const int iqs = 2 * (lane & 15);  // QI4_K=32, vdr=2 -> iqs even 0..30
   const int ib = lane >> 4;
@@ -460,7 +468,7 @@ __global__ void gemv_q4_K_q8_1(const uint8_t* __restrict__ w,
     sum += vec_dot_q4_K_q8_1(wb, yb, iqs);
   }
   #pragma unroll
-  for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, o);
+  for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffffffffffffull, sum, o);
   if (lane == 0) {
     float v = sum;
     if (bias) v += bias[row];
@@ -474,8 +482,8 @@ __global__ void gemv_q5_K_q8_1(const uint8_t* __restrict__ w,
                                float* __restrict__ dst, int blocks_per_row,
                                int num_rows, const float* __restrict__ bias,
                                const float* __restrict__ add) {
-  const int lane = threadIdx.x;
-  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  const int lane = hipThreadIdx_x;
+  const int row = hipBlockIdx_y * hipBlockDim_y + hipThreadIdx_y;
   if (row >= num_rows) return;
   const int iqs = 2 * (lane & 15);  // QI5_K=32, vdr=2 -> iqs even 0..30
   const int ib = lane >> 4;
@@ -486,7 +494,7 @@ __global__ void gemv_q5_K_q8_1(const uint8_t* __restrict__ w,
     sum += vec_dot_q5_K_q8_1(wb, yb, iqs);
   }
   #pragma unroll
-  for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, o);
+  for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffffffffffffull, sum, o);
   if (lane == 0) {
     float v = sum;
     if (bias) v += bias[row];
@@ -499,8 +507,8 @@ __global__ void gemv_q6_K_q8_1(const uint8_t* __restrict__ w,
                                const block_q8_1* __restrict__ y,
                                float* __restrict__ dst, int blocks_per_row,
                                int num_rows) {
-  const int lane = threadIdx.x;
-  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  const int lane = hipThreadIdx_x;
+  const int row = hipBlockIdx_y * hipBlockDim_y + hipThreadIdx_y;
   if (row >= num_rows) return;
   const int iqs = lane;  // Q6_K MMVQ uses VDR_Q6_K_Q8_1_MMVQ = 1.
   float sum = 0.0f;
@@ -510,7 +518,7 @@ __global__ void gemv_q6_K_q8_1(const uint8_t* __restrict__ w,
     sum += vec_dot_q6_K_q8_1(wb, yb, iqs);
   }
   #pragma unroll
-  for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, o);
+  for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffffffffffffull, sum, o);
   if (lane == 0) dst[row] = sum;
 }
 
@@ -531,8 +539,8 @@ __global__ void gemv_q6_K_q8_1(const uint8_t* __restrict__ w,
                                        int num_rows,                              \
                                        const float* __restrict__ bias,           \
                                        const float* __restrict__ add) {           \
-    const int lane = threadIdx.x;                                                 \
-    const int row = blockIdx.y * blockDim.y + threadIdx.y;                        \
+    const int lane = hipThreadIdx_x;                                                 \
+    const int row = hipBlockIdx_y * hipBlockDim_y + hipThreadIdx_y;                        \
     if (row >= num_rows) return;                                                  \
     float sum = 0.0f;                                                             \
     for (int b = lane; b < blocks_per_row; b += 32) {                             \
@@ -540,7 +548,7 @@ __global__ void gemv_q6_K_q8_1(const uint8_t* __restrict__ w,
       sum += dot(wb, y + b);                                                      \
     }                                                                             \
     _Pragma("unroll") for (int o = 16; o > 0; o >>= 1)                            \
-        sum += __shfl_down_sync(0xffffffffu, sum, o);                             \
+        sum += __shfl_down_sync(0xffffffffffffffffull, sum, o);                             \
     if (lane == 0) {                                                              \
       float v = sum;                                                              \
       if (bias) v += bias[row];                                                   \
@@ -552,8 +560,8 @@ __global__ void gemv_q6_K_q8_1(const uint8_t* __restrict__ w,
   __global__ void gemv_##suffix##_q8_1_batched(                                   \
       const uint8_t* __restrict__ w, const block_q8_1* __restrict__ y,            \
       float* __restrict__ dst, int blocks_per_row, int num_rows, int n) {         \
-    const int lane = threadIdx.x;                                                 \
-    const int row = blockIdx.y * blockDim.y + threadIdx.y;                        \
+    const int lane = hipThreadIdx_x;                                                 \
+    const int row = hipBlockIdx_y * hipBlockDim_y + hipThreadIdx_y;                        \
     if (row >= num_rows) return;                                                  \
     for (int p0 = 0; p0 < n; p0 += T) {                                           \
       const int nt = (n - p0 < T) ? (n - p0) : T;                                 \
@@ -569,7 +577,7 @@ __global__ void gemv_q6_K_q8_1(const uint8_t* __restrict__ w,
         if (t < nt) {                                                             \
           float s = sum[t];                                                       \
           _Pragma("unroll") for (int o = 16; o > 0; o >>= 1)                      \
-              s += __shfl_down_sync(0xffffffffu, s, o);                           \
+              s += __shfl_down_sync(0xffffffffffffffffull, s, o);                           \
           if (lane == 0) dst[(size_t)(p0 + t) * num_rows + row] = s;              \
         }                                                                         \
       }                                                                           \
@@ -597,8 +605,8 @@ __global__ void gemv_q3_K_q8_1_batched(const uint8_t* __restrict__ w,
                                        const block_q8_1* __restrict__ y,
                                        float* __restrict__ dst,
                                        int blocks_per_row, int num_rows, int n) {
-  const int lane = threadIdx.x;
-  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  const int lane = hipThreadIdx_x;
+  const int row = hipBlockIdx_y * hipBlockDim_y + hipThreadIdx_y;
   if (row >= num_rows) return;
   const int iqs = lane & 15;   // QI3_K=16 slices
   const int ib = lane >> 4;    // 2 blocks per warp
@@ -623,7 +631,7 @@ __global__ void gemv_q3_K_q8_1_batched(const uint8_t* __restrict__ w,
       if (t < nt) {
         float s = sum[t];
         #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffffffffffull, s, o);
         if (lane == 0) dst[(size_t)(p0 + t) * num_rows + row] = s;
       }
     }
@@ -635,8 +643,8 @@ __global__ void gemv_q4_K_q8_1_batched(const uint8_t* __restrict__ w,
                                        const block_q8_1* __restrict__ y,
                                        float* __restrict__ dst,
                                        int blocks_per_row, int num_rows, int n) {
-  const int lane = threadIdx.x;
-  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  const int lane = hipThreadIdx_x;
+  const int row = hipBlockIdx_y * hipBlockDim_y + hipThreadIdx_y;
   if (row >= num_rows) return;
   const int iqs = 2 * (lane & 15);  // QI4_K=32, vdr=2 -> iqs even 0..30
   const int ib = lane >> 4;
@@ -661,7 +669,7 @@ __global__ void gemv_q4_K_q8_1_batched(const uint8_t* __restrict__ w,
       if (t < nt) {
         float s = sum[t];
         #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffffffffffull, s, o);
         if (lane == 0) dst[(size_t)(p0 + t) * num_rows + row] = s;
       }
     }
@@ -673,8 +681,8 @@ __global__ void gemv_q5_K_q8_1_batched(const uint8_t* __restrict__ w,
                                        const block_q8_1* __restrict__ y,
                                        float* __restrict__ dst,
                                        int blocks_per_row, int num_rows, int n) {
-  const int lane = threadIdx.x;
-  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  const int lane = hipThreadIdx_x;
+  const int row = hipBlockIdx_y * hipBlockDim_y + hipThreadIdx_y;
   if (row >= num_rows) return;
   const int iqs = 2 * (lane & 15);  // QI5_K=32, vdr=2 -> iqs even 0..30
   const int ib = lane >> 4;
@@ -699,7 +707,7 @@ __global__ void gemv_q5_K_q8_1_batched(const uint8_t* __restrict__ w,
       if (t < nt) {
         float s = sum[t];
         #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffffffffffull, s, o);
         if (lane == 0) dst[(size_t)(p0 + t) * num_rows + row] = s;
       }
     }
@@ -711,8 +719,8 @@ __global__ void gemv_q6_K_q8_1_batched(const uint8_t* __restrict__ w,
                                        const block_q8_1* __restrict__ y,
                                        float* __restrict__ dst,
                                        int blocks_per_row, int num_rows, int n) {
-  const int lane = threadIdx.x;
-  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  const int lane = hipThreadIdx_x;
+  const int row = hipBlockIdx_y * hipBlockDim_y + hipThreadIdx_y;
   if (row >= num_rows) return;
   const int iqs = lane;  // Q6_K MMVQ uses VDR_Q6_K_Q8_1_MMVQ = 1.
   for (int p0 = 0; p0 < n; p0 += T) {
@@ -735,7 +743,7 @@ __global__ void gemv_q6_K_q8_1_batched(const uint8_t* __restrict__ w,
       if (t < nt) {
         float s = sum[t];
         #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffffffffffull, s, o);
         if (lane == 0) dst[(size_t)(p0 + t) * num_rows + row] = s;
       }
     }

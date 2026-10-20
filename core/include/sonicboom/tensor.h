@@ -80,4 +80,7 @@ Tensor to_device(const Tensor& t, Device device);
 // Always false for a CPU-only build. Never throws.
 bool cuda_available();
 
+// True when this build is ROCm/HIP-enabled AND an AMD GPU is present at runtime.
+bool hip_available();
+
 } // namespace nt

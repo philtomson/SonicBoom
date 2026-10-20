@@ -287,9 +287,9 @@ void clear_memory_cache() {
   g_loaded.clear();
 }
 
+#ifdef SONICBOOM_USE_CUDA
 double median_launch_ms(const std::function<bool()> &launch,
                         cudaStream_t stream, int warmups, int reps) {
-#ifdef SONICBOOM_USE_CUDA
   for (int i = 0; i < warmups; ++i) {
     // A candidate that cannot launch is dropped after one attempt; the loader
     // has already reported why, and retrying would repeat the message.
@@ -324,12 +324,50 @@ double median_launch_ms(const std::function<bool()> &launch,
   if (samples.empty()) return -1.0;
   std::sort(samples.begin(), samples.end());
   return samples[samples.size() / 2];
+}
+#elif defined(SONICBOOM_USE_ROCM)
+double median_launch_ms(const std::function<bool()> &launch,
+                        hipStream_t stream, int warmups, int reps) {
+  for (int i = 0; i < warmups; ++i) {
+    if (!launch() || hipGetLastError() != hipSuccess ||
+        hipStreamSynchronize(stream) != hipSuccess) {
+      (void)hipGetLastError();
+      return -1.0;
+    }
+  }
+  hipEvent_t begin = nullptr, end = nullptr;
+  if (hipEventCreate(&begin) != hipSuccess || hipEventCreate(&end) != hipSuccess) {
+    if (begin) hipEventDestroy(begin);
+    if (end) hipEventDestroy(end);
+    return -1.0;
+  }
+  std::vector<double> samples;
+  samples.reserve(static_cast<size_t>(std::max(reps, 1)));
+  for (int r = 0; r < reps; ++r) {
+    if (hipEventRecord(begin, stream) != hipSuccess || !launch() ||
+        hipEventRecord(end, stream) != hipSuccess ||
+        hipEventSynchronize(end) != hipSuccess) {
+      (void)hipGetLastError();
+      break;
+    }
+    float ms = 0.0f;
+    if (hipEventElapsedTime(&ms, begin, end) != hipSuccess) break;
+    samples.push_back(double(ms));
+  }
+  hipEventDestroy(begin);
+  hipEventDestroy(end);
+  if (samples.empty()) return -1.0;
+  std::sort(samples.begin(), samples.end());
+  return samples[samples.size() / 2];
+}
 #else
+double median_launch_ms(const std::function<bool()> &launch,
+                        int warmups, int reps) {
   (void)launch;
   (void)warmups;
   (void)reps;
   return -1.0;
-#endif
 }
+#endif
 
 } // namespace sonicboom::tune

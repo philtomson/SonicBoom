@@ -339,6 +339,7 @@ void test_flash_attention(std::mt19937& rng) {
 int main() {
   if (!sbnn::cuda::available()) {
     std::cout << "test_cuda_elementwise SKIP (no CUDA device)\n";
+    std::cout << std::flush;
     return 0;
   }
 
@@ -357,6 +358,7 @@ int main() {
 
   if (g_failures == 0) {
     std::cout << "test_cuda_elementwise OK\n";
+    std::cout << std::flush;
     return 0;
   }
   std::cerr << "test_cuda_elementwise FAILED: " << g_failures << " check(s)\n";

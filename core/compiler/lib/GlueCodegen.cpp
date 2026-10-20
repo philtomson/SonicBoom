@@ -63,13 +63,18 @@
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/ControlFlow/IR/ControlFlow.h>
 #include <mlir/Conversion/MathToNVVM/MathToNVVM.h>
+#include <mlir/Conversion/GPUToROCDL/GPUToROCDLPass.h>
+#include <mlir/Conversion/MathToLLVM/MathToLLVM.h>
+#include <mlir/Conversion/MathToROCDL/MathToROCDL.h>
 #include <mlir/Dialect/GPU/IR/GPUDialect.h>
 #include <mlir/Dialect/GPU/Transforms/Passes.h>
 #include <mlir/Dialect/LLVMIR/LLVMDialect.h>
 #include <mlir/Dialect/LLVMIR/NVVMDialect.h>
+#include <mlir/Dialect/LLVMIR/ROCDLDialect.h>
 #include <mlir/Dialect/Math/IR/Math.h>
 #include <mlir/Dialect/MemRef/IR/MemRef.h>
 #include <mlir/Dialect/NVGPU/IR/NVGPUDialect.h>
+#include <mlir/Dialect/AMDGPU/IR/AMDGPUDialect.h>
 #include <mlir/Dialect/SCF/IR/SCF.h>
 #include <mlir/Dialect/Vector/IR/VectorOps.h>
 #include <mlir/IR/BuiltinOps.h>
@@ -80,10 +85,12 @@
 #include <mlir/Parser/Parser.h>
 #include <mlir/Pass/PassManager.h>
 #include <mlir/Target/LLVM/NVVM/Target.h>
+#include <mlir/Target/LLVM/ROCDL/Target.h>
 #include <mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h>
 #include <mlir/Target/LLVMIR/Dialect/GPU/GPUToLLVMIRTranslation.h>
 #include <mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h>
 #include <mlir/Target/LLVMIR/Dialect/NVVM/NVVMToLLVMIRTranslation.h>
+#include <mlir/Target/LLVMIR/Dialect/ROCDL/ROCDLToLLVMIRTranslation.h>
 
 #include <llvm/Support/TargetSelect.h>
 
@@ -1427,9 +1434,93 @@ constexpr const char *kGeluMul = R"MLIR(module attributes {gpu.container_module}
   }
 })MLIR";
 
+// The region texts are written against the NVVM dialect, which is what the
+// PTX path wants: `nvvm.sqrt ... {rnd = rn}` is the IEEE-correctly-rounded
+// sqrt (and keeps the reduction's `te + eps` semantics), and
+// `nvvm.addf ... {rnd = rz}` is the round-toward-zero add that makes
+// `roundf(x)` come out as nvcc's `add.rz(sign | 0.5) + cvt.rzi`.
+//
+// AMDGPU has neither of those NVVM ops (and no f32 add with a rounding mode at
+// all), so the ROCDL path rewrites them: the sqrt becomes `math.sqrt`, which
+// ConvertMathToROCDL turns into `rocdl.sqrt` (IEEE correctly rounded, like the
+// NVVM op), and the round becomes `llvm.intr.round` — `roundf` itself (ties
+// away from zero), so the sign-bit + 0.5 + truncate sequence collapses into one
+// op and no `rz` add is needed. The now-dead sign/0.5 ops are left to LLVM's
+// DCE.
+std::string amdgpu_rewrite_nvvm(std::string_view text) {
+  std::string out;
+  out.reserve(text.size());
+  std::size_t pos = 0;
+  while (pos < text.size()) {
+    const std::size_t nl = text.find('\n', pos);
+    const std::size_t end = nl == std::string_view::npos ? text.size() : nl;
+    std::string_view line = text.substr(pos, end - pos);
+    const std::size_t assign = line.find(" = ");
+    const std::size_t op = assign == std::string_view::npos
+                               ? std::string_view::npos
+                               : assign + 3;
+    if (op != std::string_view::npos &&
+        line.substr(op, 10) == "nvvm.sqrt ") {
+      std::string_view rest = line.substr(op + 10);
+      const std::size_t brace = rest.find(" {");
+      if (brace != std::string_view::npos) {
+        out.append(line.substr(0, op));
+        out.append("math.sqrt ");
+        out.append(rest.substr(0, brace));
+        out.append(" : f32");
+        out.push_back('\n');
+        pos = end == text.size() ? text.size() : end + 1;
+        continue;
+      }
+    }
+    if (op != std::string_view::npos &&
+        line.substr(op, 10) == "nvvm.addf ") {
+      std::string_view rest = line.substr(op + 10);
+      const std::size_t comma = rest.find(',');
+      const std::size_t brace = rest.find(" {");
+      if (comma != std::string_view::npos && brace != std::string_view::npos &&
+          comma < brace) {
+        out.append(line.substr(0, op));
+        out.append("llvm.intr.round(");
+        out.append(rest.substr(0, comma));
+        out.append(") : (f32) -> f32");
+        out.push_back('\n');
+        pos = end == text.size() ? text.size() : end + 1;
+        continue;
+      }
+    }
+    out.append(line);
+    if (nl != std::string_view::npos) out.push_back('\n');
+    pos = nl == std::string_view::npos ? text.size() : nl + 1;
+  }
+  return out;
+}
+
 // The region text for `kind`, with the target chip substituted. Empty when the
-// kind has no generator.
-std::string region_text(GlueRegionKind kind, int sm_arch) {
+// kind has no generator. `amdgpu` selects the ROCDL target attribute (and a
+// gfx chip string) instead of the NVVM one — the ROCm twin of the NVPTX path.
+// The block size the region's launcher uses (the k*BlockThreads constants
+// below); the AMDGPU path declares it on the gpu.func because the ROCDL
+// translation's default launch bound is 256.
+int glue_region_block_threads(GlueRegionKind kind) {
+  switch (kind) {
+    case GlueRegionKind::RmsNormQuantizeQ8_1:
+      return kGlueBlockThreads;
+    case GlueRegionKind::AddRmsNormQuantizeMmqQ8_1:
+      return kAddRmsNormBlockThreads;
+    case GlueRegionKind::RmsNormAdd:
+      return kRmsNormAddBlockThreads;
+    case GlueRegionKind::HeadsNormRopeCast:
+      return kHeadsNormRopeCastBlockThreads;
+    case GlueRegionKind::SliceScale:
+      return kSliceScaleBlockThreads;
+    case GlueRegionKind::GeluMul:
+      return kGeluMulBlockThreads;
+  }
+  return 1;
+}
+
+std::string region_text(GlueRegionKind kind, int arch, bool amdgpu) {
   const char *text = nullptr;
   switch (kind) {
     case GlueRegionKind::RmsNormQuantizeQ8_1:
@@ -1453,23 +1544,58 @@ std::string region_text(GlueRegionKind kind, int sm_arch) {
   }
   if (text == nullptr) return {};
 
-  const std::string chip = "sm_" + std::to_string(sm_arch);
+  // The module header carries the target attribute with the chip placeholder
+  // (`%CHIP%`). For the AMDGPU path we must swap the NVVM target for the ROCDL
+  // target and request wave32 (the glue kernels' shuffle/reduction trees are
+  // hard-coded to 32 lanes).
+  const std::string chip = amdgpu ? "gfx" + std::to_string(arch)
+                                  : "sm_" + std::to_string(arch);
+  const std::string from_attr = "#nvvm.target<chip = \"%CHIP%\">";
+  const std::string to_attr =
+      amdgpu ? "#rocdl.target<chip = \"" + chip + "\", flags = {no_wave64}>"
+             : "#nvvm.target<chip = \"" + chip + "\">";
+
   std::string out;
-  out.reserve(std::char_traits<char>::length(text) + chip.size());
+  out.reserve(std::char_traits<char>::length(text) + chip.size() + 16);
   const std::string_view view(text);
-  const std::string_view placeholder = "%CHIP%";
+  const std::string_view attr(from_attr);
   std::size_t pos = 0;
   while (true) {
-    const std::size_t at = view.find(placeholder, pos);
+    const std::size_t at = view.find(attr, pos);
     if (at == std::string_view::npos) {
       out.append(view.substr(pos));
       break;
     }
     out.append(view.substr(pos, at - pos));
-    out.append(chip);
-    pos = at + placeholder.size();
+    out.append(to_attr);
+    pos = at + attr.size();
   }
-  return out;
+  if (!amdgpu) return out;
+  // Declare each kernel's block size on its gpu.func. The ROCDL LLVM IR
+  // translation otherwise stamps every kernel `llvm.func` with
+  // `amdgpu-flat-work-group-size = "1,256"`, which rejects the 1024-thread
+  // launch of the decode region ("Launch params ... larger than launch bounds").
+  // lower_gpu_module_to_hsaco turns this attribute into the work-group size
+  // the loader checks.
+  const std::string block =
+      " attributes {gpu.known_block_size = array<i32: " +
+      std::to_string(glue_region_block_threads(kind)) + ", 1, 1>}";
+  std::string sized;
+  sized.reserve(out.size() + 64);
+  std::size_t at = 0;
+  while (true) {
+    const std::size_t hit = out.find(") kernel {", at);
+    if (hit == std::string::npos) {
+      sized.append(out, at, std::string::npos);
+      break;
+    }
+    sized.append(out, at, hit - at + 2);  // through the ')'
+    sized.append("kernel");
+    sized.append(block);
+    sized.append(" {");
+    at = hit + 10;
+  }
+  return amdgpu_rewrite_nvvm(sized);
 }
 
 // The NVPTX target's serialization (gpu.module -> binary with the assembly
@@ -1582,7 +1708,7 @@ const char *glue_kernel_entry(GlueRegionKind kind) noexcept {
 
 std::optional<std::string> generate_glue_ptx(GlueRegionKind kind,
                                              int sm_arch) {
-  const std::string text = region_text(kind, sm_arch);
+  const std::string text = region_text(kind, sm_arch, /*amdgpu=*/false);
   if (text.empty()) {
     std::fprintf(stderr, "glue codegen: region '%s' has no generator\n",
                  glue_region_name(kind));
@@ -1598,6 +1724,9 @@ std::optional<std::string> lower_gpu_module_to_ptx(std::string_view mlir_text,
                                                    std::string_view what) {
   const std::string text(mlir_text);
   const std::string name(what);
+  // The ROCDL serializer resolves the device-library calls (ocml/ockl) itself,
+  // so unlike the NVPTX path there is no libdevice file to link here.
+  (void)link_libdevice;
   mlir::DialectRegistry registry;
   registry.insert<mlir::arith::ArithDialect, mlir::cf::ControlFlowDialect,
                   mlir::gpu::GPUDialect, mlir::LLVM::LLVMDialect,
@@ -1666,7 +1795,10 @@ std::optional<std::string> lower_gpu_module_to_ptx(std::string_view mlir_text,
   pm.addNestedPass<mlir::gpu::GPUModuleOp>(
       mlir::createReconcileUnrealizedCastsPass());
   pm.addPass(mlir::createReconcileUnrealizedCastsPass());
+
   mlir::GpuModuleToBinaryPassOptions binary;
+  // The PTX target's serialization is assembly; the CUDA toolkit's libdevice
+  // is linked in when the region calls its math.
   binary.compilationTarget = "assembly";
   if (link_libdevice) {
     const std::string libdevice = find_libdevice();
@@ -1723,7 +1855,175 @@ std::string glue_codegen_version() {
   // does not record. (The cache also stores a hash of the generated text and
   // ignores an entry whose body does not match, so a stale entry cannot run
   // even without a bump; this keeps the two checks independent.)
-  return std::string("llvm-") + LLVM_VERSION_STRING + "-glue3";
+  return std::string("llvm-") + LLVM_VERSION_STRING + "-glue4";
+}
+
+// --- ROCm / AMDGPU glue-region path (Phase 2) -------------------------------
+//
+// Lower the same region text to an HSA code object (HSACO) for an AMDGPU chip.
+// The ROCDL serializer (mlir/Target/LLVM/ROCDL) drives the AMDGPU LLVM backend
+// and links the ROCm device libraries (ocml/ockl) for the trig regions; its
+// `compileToBinary` path requires a valid ROCm toolkit (ROCM_PATH) for lld.
+
+void register_amdgpu_target() {
+  static const bool once = [] {
+    LLVMInitializeAMDGPUTargetInfo();
+    LLVMInitializeAMDGPUTarget();
+    LLVMInitializeAMDGPUTargetMC();
+    LLVMInitializeAMDGPUAsmParser();
+    LLVMInitializeAMDGPUAsmPrinter();
+    return true;
+  }();
+  (void)once;
+}
+
+std::optional<std::string> lower_gpu_module_to_hsaco(std::string_view mlir_text,
+                                                     bool link_libdevice,
+                                                     std::string_view what) {
+  const std::string text(mlir_text);
+  const std::string name(what);
+  // The ROCDL serializer resolves the device-library calls (ocml/ockl) itself,
+  // so unlike the NVPTX path there is no libdevice file to link here.
+  (void)link_libdevice;
+  mlir::DialectRegistry registry;
+  registry.insert<mlir::arith::ArithDialect, mlir::cf::ControlFlowDialect,
+                  mlir::gpu::GPUDialect, mlir::LLVM::LLVMDialect,
+                  mlir::math::MathDialect, mlir::memref::MemRefDialect,
+                  mlir::scf::SCFDialect, mlir::vector::VectorDialect,
+                  mlir::ROCDL::ROCDLDialect,
+                  mlir::amdgpu::AMDGPUDialect>();
+  // The `#rocdl.target` serialization and the ROCDL-dialect LLVM IR translation
+  // are external models, like the NVVM equivalents.
+  mlir::ROCDL::registerROCDLTargetInterfaceExternalModels(registry);
+  mlir::registerROCDLDialectTranslation(registry);
+  mlir::registerBuiltinDialectTranslation(registry);
+  mlir::registerGPUDialectTranslation(registry);
+  mlir::registerLLVMDialectTranslation(registry);
+  mlir::registerConvertMemRefToLLVMInterface(registry);
+  // The GPU-to-ROCDL conversion legalizes the ops its own patterns create
+  // through each loaded dialect's ConvertToLLVMPatternInterface: the shuffle
+  // lowering emits `arith.constant` (lane-id operands) and the SCF-to-CF
+  // lowering leaves `cf` branches. Without these interfaces those new ops are
+  // unlegalizable and the whole rewrite is rolled back (the shuffle stays
+  // illegal), exactly as if the pattern had failed.
+  mlir::arith::registerConvertArithToLLVMInterface(registry);
+  mlir::cf::registerConvertControlFlowToLLVMInterface(registry);
+  mlir::MLIRContext context(registry, mlir::MLIRContext::Threading::DISABLED);
+  context.loadAllAvailableDialects();
+
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(text, &context);
+  if (!module) {
+    std::fprintf(stderr, "glue codegen: the %s module did not parse\n",
+                 name.c_str());
+    return std::nullopt;
+  }
+
+  register_amdgpu_target();
+
+  mlir::PassManager pm(&context);
+  // The trig regions' exp/cos/sin convert through the AMD device library
+  // (ocml); the RMS-norm sqrt is `math.sqrt` in every region. The non-trig
+  // regions have no math ops beyond that, so the pass is otherwise a no-op.
+  pm.addPass(mlir::createConvertMathToROCDL());
+  // ConvertMathToROCDL deliberately leaves `math.sqrt` to the LLVM conversion
+  // (its sqrt is IEEE-correctly-rounded, unlike the approximate rocdl.sqrt),
+  // and marks `llvm.sqrt` illegal so it cannot be introduced earlier. Run the
+  // LLVM math conversion after it to finish the sqrt.
+  pm.addPass(mlir::createConvertMathToLLVMPass());
+  pm.addPass(mlir::createSCFToControlFlowPass());
+  pm.addPass(mlir::createArithToLLVMConversionPass());
+  pm.addPass(mlir::createConvertControlFlowToLLVMPass());
+  pm.addNestedPass<mlir::gpu::GPUModuleOp>(
+      mlir::createConvertGpuOpsToROCDLOps());
+  pm.addPass(mlir::createConvertVectorToLLVMPass());
+  pm.addNestedPass<mlir::gpu::GPUModuleOp>(
+      mlir::createReconcileUnrealizedCastsPass());
+  pm.addPass(mlir::createReconcileUnrealizedCastsPass());
+
+  std::string diagnostics;
+  mlir::ScopedDiagnosticHandler capture(
+      &context, [&](mlir::Diagnostic &diag) {
+        llvm::raw_string_ostream os(diagnostics);
+        diag.print(os);
+        os << '\n';
+        return mlir::success();
+      });
+
+  if (mlir::failed(pm.run(*module))) {
+    std::fprintf(stderr, "glue codegen: ROCDL lowering the %s module failed\n%s",
+                 name.c_str(), diagnostics.c_str());
+    return std::nullopt;
+  }
+
+  // The ROCDL LLVM IR translation stamps every kernel with
+  // `amdgpu-flat-work-group-size = "1,256"` unless the llvm.func already
+  // carries the attribute, and in this LLVM the GPU-to-ROCDL conversion does
+  // not turn the gpu.func's `gpu.known_block_size` into a work-group-size
+  // attribute (the lowered llvm.func keeps `gpu.known_block_size` but gets no
+  // `rocdl.reqd_work_group_size`). A 1024-thread launch of the decode region
+  // then fails in hipModuleLaunchKernel with "Launch params (1024, 1, 1) are
+  // larger than launch bounds (256)". Declare the bound here from the known
+  // block size; the translation maps `rocdl.max_flat_work_group_size` to the
+  // function attribute the loader checks.
+  module->walk([&](mlir::LLVM::LLVMFuncOp func) {
+    auto known = func->getAttrOfType<mlir::DenseI32ArrayAttr>(
+        mlir::gpu::GPUDialect::KnownBlockSizeAttrHelper::getNameStr());
+    if (!known || known.asArrayRef().size() != 3) return;
+    uint64_t flat = 1;
+    for (int32_t extent : known.asArrayRef()) flat *= uint32_t(extent);
+    func->setAttr(
+        mlir::ROCDL::ROCDLDialect::MaxFlatWorkGroupSizeAttrHelper::getNameStr(),
+        mlir::IntegerAttr::get(mlir::IntegerType::get(&context, 32),
+                               static_cast<int32_t>(flat)));
+  });
+
+  mlir::PassManager binary_pm(&context);
+  mlir::GpuModuleToBinaryPassOptions binary;
+  // "bin" asks the ROCDL serializer for a single-arch HSA code object (vs
+  // "assembly" = GCN ISA text). The serializer links the AMDGPU object with
+  // lld from the ROCm toolkit.
+  binary.compilationTarget = "bin";
+  binary_pm.addPass(mlir::createGpuModuleToBinaryPass(binary));
+  if (mlir::failed(binary_pm.run(*module))) {
+    std::fprintf(stderr,
+                 "glue codegen: ROCDL serializing the %s module failed\n%s",
+                 name.c_str(), diagnostics.c_str());
+    return std::nullopt;
+  }
+
+  std::string hsaco;
+  module->walk([&](mlir::gpu::BinaryOp op) {
+    for (mlir::Attribute entry : op.getObjects()) {
+      auto object = mlir::dyn_cast<mlir::gpu::ObjectAttr>(entry);
+      // The ROCDL serializer maps fatbin -> binary; accept either.
+      if (!object || object.getFormat() == mlir::gpu::CompilationTarget::Assembly)
+        continue;
+      hsaco = object.getObject().getValue().str();
+      return mlir::WalkResult::interrupt();
+    }
+    return mlir::WalkResult::advance();
+  });
+  if (hsaco.empty()) {
+    std::fprintf(stderr,
+                 "glue codegen: the %s module produced no HSA code object\n",
+                 name.c_str());
+    return std::nullopt;
+  }
+  return hsaco;
+}
+
+std::optional<std::string> generate_glue_hsaco(GlueRegionKind kind,
+                                               int gfx_arch) {
+  const std::string text = region_text(kind, gfx_arch, /*amdgpu=*/true);
+  if (text.empty()) {
+    std::fprintf(stderr, "glue codegen: region '%s' has no generator\n",
+                 glue_region_name(kind));
+    return std::nullopt;
+  }
+  const bool libdevice = kind == GlueRegionKind::HeadsNormRopeCast ||
+                         kind == GlueRegionKind::GeluMul;
+  return lower_gpu_module_to_hsaco(text, libdevice, glue_region_name(kind));
 }
 
 } // namespace sonicboom::compiler

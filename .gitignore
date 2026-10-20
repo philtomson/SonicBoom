@@ -1,6 +1,7 @@
 # build outputs
 /build/
 /build-nocuda/
+/build-rocm/
 /cmake-build-*/
 /Testing/
 

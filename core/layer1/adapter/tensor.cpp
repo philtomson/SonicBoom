@@ -21,6 +21,9 @@
 #ifdef SONICBOOM_USE_CUDA
 #include <cuda_runtime_api.h>
 #endif
+#ifdef SONICBOOM_USE_ROCM
+#include <hip/hip_runtime.h>
+#endif
 
 namespace nt {
 
@@ -72,6 +75,15 @@ bool cuda_available() {
 #ifdef SONICBOOM_USE_CUDA
   int count = 0;
   return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
+#else
+  return false;
+#endif
+}
+
+bool hip_available() {
+#ifdef SONICBOOM_USE_ROCM
+  int count = 0;
+  return hipGetDeviceCount(&count) == hipSuccess && count > 0;
 #else
   return false;
 #endif

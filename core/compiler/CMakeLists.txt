@@ -153,6 +153,23 @@ target_link_libraries(sonicboom_compiler PRIVATE
   # The nvvm dialect's LLVM IR translation interface (nvvm ops -> LLVM IR for
   # the NVPTX backend). Without it the target serializer has no translator.
   MLIRNVVMToLLVMIRTranslation
+  # ROCm/AMDGPU glue-region path (Phase 2): the same gpu.module lowered to the
+  # ROCDL dialect and serialized by the AMDGPU target (HSACO code object).
+  # Only used on SONICBOOM_USE_ROCM builds, but linked unconditionally so the
+  # compiler library builds the same everywhere.
+  MLIRGPUToROCDLTransforms
+  MLIRMathToROCDL
+  MLIRMathToLLVM
+  MLIRROCDLDialect
+  MLIRROCDLTarget
+  MLIRROCDLToLLVMIRTranslation
+  MLIRAMDGPUDialect
+  MLIRAMDGPUToROCDL
+  LLVMAMDGPUCodeGen
+  LLVMAMDGPUDesc
+  LLVMAMDGPUInfo
+  LLVMAMDGPUAsmParser
+  LLVMAMDGPUUtils
   # The gpu.module -> LLVM module translation (the serializer translates the
   # module before handing it to NVPTX).
   MLIRGPUToLLVMIRTranslation

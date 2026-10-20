@@ -62,10 +62,18 @@
 
 #pragma once
 
+#if defined(__HIPCC__)
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#else
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>    // __half2float, __float2half, __half22float2, __halves2half2
 #include <cuda_fp16.hpp>  // half / half2 types, make_half2, arithmetic operators
 #include <sm_32_intrinsics.h>  // __vsub4
+// The bodies below are in the hipify spelling (hipThreadIdx_x, hipStream_t, …);
+// this maps those names onto the CUDA runtime for the nvcc build.
+#include "../hip_compat.h"
+#endif
 
 #include <cstdint>
 
@@ -193,11 +201,11 @@ struct tile {
 
   static __device__ __forceinline__ int get_i(const int l) {
     if constexpr (I == 8 && J == 4) {
-      return threadIdx.x / 4;
+      return hipThreadIdx_x / 4;
     } else if constexpr (I == 8 && J == 8) {
-      return threadIdx.x / 4;
+      return hipThreadIdx_x / 4;
     } else if constexpr (I == 16 && J == 8) {
-      return ((l / 2) * 8) + (threadIdx.x / 4);
+      return ((l / 2) * 8) + (hipThreadIdx_x / 4);
     } else {
       return -1;  // unreachable for the tiles used here
     }
@@ -205,11 +213,11 @@ struct tile {
 
   static __device__ __forceinline__ int get_j(const int l) {
     if constexpr (I == 8 && J == 4) {
-      return threadIdx.x % 4;
+      return hipThreadIdx_x % 4;
     } else if constexpr (I == 8 && J == 8) {
-      return (l * 4) + (threadIdx.x % 4);
+      return (l * 4) + (hipThreadIdx_x % 4);
     } else if constexpr (I == 16 && J == 8) {
-      return ((threadIdx.x % 4) * 2) + (l % 2);
+      return ((hipThreadIdx_x % 4) * 2) + (l % 2);
     } else {
       return -1;  // unreachable for the tiles used here
     }
@@ -224,9 +232,27 @@ __device__ __forceinline__ void load_generic(tile<I, J>& t, const int* xs0, int 
   }
 }
 
+#if defined(__HIPCC__)
+// ROCm: the NVIDIA mma/ldmatrix asm below is PTX and will not assemble. The
+// MMQ tensor-core kernels are disabled on ROCm (mmq_enabled() returns false),
+// so these are compile-only stubs — v_dot is never invoked, and the K-quant
+// matmul falls through to the cuBLAS fp16 / scalar gemv path.
+__device__ __forceinline__ void load_ldmatrix(tile<16, 8>& t, const int* xs0, int stride) {
+  (void)t; (void)xs0; (void)stride;
+}
+__device__ __forceinline__ void load_ldmatrix(tile<16, 4>& t, const int* xs0, int stride) {
+  (void)t; (void)xs0; (void)stride;
+}
+__device__ __forceinline__ void mma(tile<16, 8>& D, const tile<16, 4>& A, const tile<8, 4>& B) {
+  (void)D; (void)A; (void)B;
+}
+__device__ __forceinline__ void mma(tile<16, 8>& D, const tile<16, 8>& A, const tile<8, 8>& B) {
+  (void)D; (void)A; (void)B;
+}
+#else
 __device__ __forceinline__ void load_ldmatrix(tile<16, 8>& t, const int* xs0, int stride) {
   int* xi = (int*)t.x;
-  const int* xs = xs0 + (threadIdx.x % t.I) * stride + (threadIdx.x / t.I) * (t.J / 2);
+  const int* xs = xs0 + (hipThreadIdx_x % t.I) * stride + (hipThreadIdx_x / t.I) * (t.J / 2);
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0,%1,%2,%3}, [%4];"
                : "=r"(xi[0]), "=r"(xi[1]), "=r"(xi[2]), "=r"(xi[3])
                : "l"(xs));
@@ -234,7 +260,7 @@ __device__ __forceinline__ void load_ldmatrix(tile<16, 8>& t, const int* xs0, in
 
 __device__ __forceinline__ void load_ldmatrix(tile<16, 4>& t, const int* xs0, int stride) {
   int* xi = t.x;
-  const int* xs = xs0 + (threadIdx.x % 16) * stride;
+  const int* xs = xs0 + (hipThreadIdx_x % 16) * stride;
   asm volatile("ldmatrix.sync.aligned.m8n8.x2.b16 {%0,%1}, [%2];"
                : "=r"(xi[0]), "=r"(xi[1])
                : "l"(xs));
@@ -254,6 +280,7 @@ __device__ __forceinline__ void mma(tile<16, 8>& D, const tile<16, 8>& A, const 
       : "+r"(D.x[0]), "+r"(D.x[1]), "+r"(D.x[2]), "+r"(D.x[3])
       : "r"(A.x[0]), "r"(A.x[1]), "r"(A.x[2]), "r"(A.x[3]), "r"(B.x[0]), "r"(B.x[1]));
 }
+#endif
 
 // --- Q4_K / Q5_K scale unpack (ggml mmq-load-tiles.cuh) -------------------
 
@@ -273,11 +300,11 @@ __device__ __forceinline__ void load_tiles_q3_K(const char* x, int* x_tile, int 
 
   constexpr int threads_per_row = MMQ_ITER_K / (4 * QR3_K);  // 16
   constexpr int nrows = WARP_SIZE / threads_per_row;         // 2
-  const int kqsx = threadIdx.x % threads_per_row;
+  const int kqsx = hipThreadIdx_x % threads_per_row;
 
 #pragma unroll
   for (int i0 = 0; i0 < I; i0 += nrows*NWARPS) {
-    int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
+    int i = i0 + hipThreadIdx_y*nrows + hipThreadIdx_x/threads_per_row;
     const block_q3_K* bxi = (const block_q3_K*)x + kbx0 + i*stride;
     const int x_ql_0 = get_int_b2(bxi->qs, kqsx);
     const int x_qh_0 = get_int_b2(bxi->hmask, kqsx % (QI3_K/2)) >> (4 * (kqsx / (QI3_K/2)));
@@ -294,9 +321,9 @@ __device__ __forceinline__ void load_tiles_q3_K(const char* x, int* x_tile, int 
   constexpr int rows_per_warp = WARP_SIZE / 4;  // 8
 #pragma unroll
   for (int i0 = 0; i0 < I; i0 += NWARPS*rows_per_warp) {
-    int i = i0 + threadIdx.y*rows_per_warp + threadIdx.x/4;
+    int i = i0 + hipThreadIdx_y*rows_per_warp + hipThreadIdx_x/4;
     const block_q3_K* bxi = (const block_q3_K*)x + kbx0 + i*stride;
-    const int ksc = threadIdx.x % 4;
+    const int ksc = hipThreadIdx_x % 4;
     const int sc_low = (get_int_b2(bxi->scales, ksc % (QI3_K/8)) >> (4 * (ksc / (QI3_K/8)))) & 0x0F0F0F0F;
     const int sc_high = ((get_int_b2(bxi->scales, QI3_K/8) >> (2*ksc)) << 4) & 0x30303030;
     const int sc = __vsub4(sc_low | sc_high, 0x20202020);
@@ -318,11 +345,11 @@ __device__ __forceinline__ void load_tiles_q4_K(const char* x, int* x_tile, int 
 
   constexpr int threads_per_row = MMQ_ITER_K / (4 * QR4_K);  // 32
   constexpr int nrows = WARP_SIZE / threads_per_row;         // 1
-  const int txi = WARP_SIZE > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+  const int txi = WARP_SIZE > threads_per_row ? hipThreadIdx_x % threads_per_row : hipThreadIdx_x;
 
 #pragma unroll
   for (int i0 = 0; i0 < I; i0 += nrows*NWARPS) {
-    int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+    int i = i0 + (nrows == 1 ? hipThreadIdx_y : hipThreadIdx_y*nrows + hipThreadIdx_x/threads_per_row);
     const block_q4_K* bxi = (const block_q4_K*)x + kbx0 + i*stride;
     const int qs0 = get_int_b4(bxi->qs, txi);
     x_qs[i*sram_stride + 16*(txi/8) + txi % 8 + 0] = (qs0 >> 0) & 0x0F0F0F0F;
@@ -332,10 +359,10 @@ __device__ __forceinline__ void load_tiles_q4_K(const char* x, int* x_tile, int 
   constexpr int rows_per_warp = WARP_SIZE / 2;  // 16
 #pragma unroll
   for (int i0 = 0; i0 < I; i0 += NWARPS*rows_per_warp) {
-    int i = (i0 + threadIdx.y*rows_per_warp + threadIdx.x/2) % I;
+    int i = (i0 + hipThreadIdx_y*rows_per_warp + hipThreadIdx_x/2) % I;
     const block_q4_K* bxi = (const block_q4_K*)x + kbx0 + i*stride;
     const int* scales = (const int*)bxi->scales;
-    const int ksc = threadIdx.x % 2;
+    const int ksc = hipThreadIdx_x % 2;
     const int sc32 = unpack_scales_q45_K(scales, ksc + 0);
     const int m32  = unpack_scales_q45_K(scales, ksc + 2);
     const uint8_t* sc8 = (const uint8_t*)&sc32;
@@ -357,11 +384,11 @@ __device__ __forceinline__ void load_tiles_q5_K(const char* x, int* x_tile, int 
 
   constexpr int threads_per_row = MMQ_ITER_K / (4 * QR5_K);  // 32
   constexpr int nrows = WARP_SIZE / threads_per_row;         // 1
-  const int txi = WARP_SIZE > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+  const int txi = WARP_SIZE > threads_per_row ? hipThreadIdx_x % threads_per_row : hipThreadIdx_x;
 
 #pragma unroll
   for (int i0 = 0; i0 < I; i0 += nrows*NWARPS) {
-    int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+    int i = i0 + (nrows == 1 ? hipThreadIdx_y : hipThreadIdx_y*nrows + hipThreadIdx_x/threads_per_row);
     const block_q5_K* bxi = (const block_q5_K*)x + kbx0 + i*stride;
     const int ky = QR5_K*txi;                 // 2*txi
     const int ql = get_int_b4(bxi->qs, txi);
@@ -379,10 +406,10 @@ __device__ __forceinline__ void load_tiles_q5_K(const char* x, int* x_tile, int 
   constexpr int rows_per_warp = WARP_SIZE / 2;  // 16
 #pragma unroll
   for (int i0 = 0; i0 < I; i0 += NWARPS*rows_per_warp) {
-    int i = (i0 + threadIdx.y*rows_per_warp + threadIdx.x/2) % I;
+    int i = (i0 + hipThreadIdx_y*rows_per_warp + hipThreadIdx_x/2) % I;
     const block_q5_K* bxi = (const block_q5_K*)x + kbx0 + i*stride;
     const int* scales = (const int*)bxi->scales;
-    const int ksc = threadIdx.x % 2;
+    const int ksc = hipThreadIdx_x % 2;
     const int sc32 = unpack_scales_q45_K(scales, ksc + 0);
     const int m32  = unpack_scales_q45_K(scales, ksc + 2);
     const uint8_t* sc8 = (const uint8_t*)&sc32;
@@ -404,11 +431,11 @@ __device__ __forceinline__ void load_tiles_q6_K(const char* x, int* x_tile,
   int* x_sc = reinterpret_cast<int*>(x_df + 1);
   constexpr int threads_per_row = MMQ_ITER_K / (4 * QR5_K);
   constexpr int nrows = WARP_SIZE / threads_per_row;
-  const int txi = WARP_SIZE > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+  const int txi = WARP_SIZE > threads_per_row ? hipThreadIdx_x % threads_per_row : hipThreadIdx_x;
 
 #pragma unroll
   for (int i0 = 0; i0 < I; i0 += nrows * NWARPS) {
-    const int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y * nrows + threadIdx.x / threads_per_row);
+    const int i = i0 + (nrows == 1 ? hipThreadIdx_y : hipThreadIdx_y * nrows + hipThreadIdx_x / threads_per_row);
     const block_q6_K* bxi = reinterpret_cast<const block_q6_K*>(x) + kbx0 + i * stride;
     const int ql = get_int_b2(bxi->ql, txi);
     const int ql0 = (ql >> 0) & 0x0F0F0F0F;
@@ -424,16 +451,16 @@ __device__ __forceinline__ void load_tiles_q6_K(const char* x, int* x_tile,
 
 #pragma unroll
   for (int i0 = 0; i0 < I; i0 += NWARPS * WARP_SIZE) {
-    const int i = (i0 + threadIdx.y * WARP_SIZE + threadIdx.x) % I;
+    const int i = (i0 + hipThreadIdx_y * WARP_SIZE + hipThreadIdx_x) % I;
     const block_q6_K* bxi = reinterpret_cast<const block_q6_K*>(x) + kbx0 + i * stride;
     x_df[i * sram_stride] = float(bxi->d);
   }
 
 #pragma unroll
   for (int i0 = 0; i0 < I; i0 += NWARPS * (WARP_SIZE / 4)) {
-    const int i = (i0 + threadIdx.y * (WARP_SIZE / 4) + threadIdx.x / 4) % I;
+    const int i = (i0 + hipThreadIdx_y * (WARP_SIZE / 4) + hipThreadIdx_x / 4) % I;
     const block_q6_K* bxi = reinterpret_cast<const block_q6_K*>(x) + kbx0 + i * stride;
-    const int scale_word = threadIdx.x % 4;
+    const int scale_word = hipThreadIdx_x % 4;
     // block_q6_K is 210 bytes, so every other block starts 2 mod 4. Use the
     // two-byte-aligned loader for its packed scale words instead of get_int_b4.
     x_sc[i * sram_stride + scale_word] = get_int_b2(bxi->scales, scale_word);
@@ -452,13 +479,13 @@ __device__ __forceinline__ void load_tiles_q5_0(const char* x, int* x_tile,
 
   constexpr int threads_per_row = MMQ_ITER_K / (4 * QR5_0);  // 32
   constexpr int nrows = WARP_SIZE / threads_per_row;         // 1
-  const int txi  = WARP_SIZE > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+  const int txi  = WARP_SIZE > threads_per_row ? hipThreadIdx_x % threads_per_row : hipThreadIdx_x;
   const int kbx  = txi / QI5_0;
   const int kqsx = txi % QI5_0;
 
 #pragma unroll
   for (int i0 = 0; i0 < I; i0 += nrows*NWARPS) {
-    const int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+    const int i = i0 + (nrows == 1 ? hipThreadIdx_y : hipThreadIdx_y*nrows + hipThreadIdx_x/threads_per_row);
     const block_q5_0* bxi = (const block_q5_0*)x + kbx0 + i*stride + kbx;
 
     const int ql = get_int_b2(bxi->qs, kqsx);            // 16 low nibbles
@@ -484,10 +511,10 @@ __device__ __forceinline__ void load_tiles_q5_0(const char* x, int* x_tile,
 
   constexpr int blocks_per_tile_x_row = MMQ_TILE_NE_K / QI5_0;  // 8
   constexpr int rows_per_warp = WARP_SIZE / blocks_per_tile_x_row;  // 4
-  const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+  const int kbxd = hipThreadIdx_x % blocks_per_tile_x_row;
 #pragma unroll
   for (int i0 = 0; i0 < I; i0 += NWARPS*rows_per_warp) {
-    const int i = i0 + threadIdx.y*rows_per_warp + threadIdx.x/blocks_per_tile_x_row;
+    const int i = i0 + hipThreadIdx_y*rows_per_warp + hipThreadIdx_x/blocks_per_tile_x_row;
     const block_q5_0* bxi = (const block_q5_0*)x + kbx0 + i*stride + kbxd;
     x_df[i*sram_stride + kbxd] = float(bxi->d);
   }
@@ -505,13 +532,13 @@ __device__ __forceinline__ void load_tiles_q8_0(const char* x, int* x_tile,
 
   constexpr int threads_per_row = 32;  // MMQ_ITER_K/(4*QR8_0) would be 64
   constexpr int nrows = WARP_SIZE / threads_per_row;  // 1
-  const int txi  = WARP_SIZE > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+  const int txi  = WARP_SIZE > threads_per_row ? hipThreadIdx_x % threads_per_row : hipThreadIdx_x;
   const int kbx  = txi / QI8_0;
   const int kqsx = txi % QI8_0;
 
 #pragma unroll
   for (int i0 = 0; i0 < I; i0 += nrows*NWARPS) {
-    const int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+    const int i = i0 + (nrows == 1 ? hipThreadIdx_y : hipThreadIdx_y*nrows + hipThreadIdx_x/threads_per_row);
     const block_q8_0* bxi = (const block_q8_0*)x + kbx0 + i*stride + kbx;
     x_qs[i*sram_stride + 0              + txi] = get_int_b2(bxi[0].qs, kqsx);
     x_qs[i*sram_stride + MMQ_TILE_NE_K  + txi] = get_int_b2(bxi[MMQ_TILE_NE_K/QI8_0].qs, kqsx);
@@ -519,10 +546,10 @@ __device__ __forceinline__ void load_tiles_q8_0(const char* x, int* x_tile,
 
   constexpr int blocks_per_tile_x_row = 2*MMQ_TILE_NE_K / QI8_0;  // 8
   constexpr int rows_per_warp = WARP_SIZE / blocks_per_tile_x_row;  // 4
-  const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+  const int kbxd = hipThreadIdx_x % blocks_per_tile_x_row;
 #pragma unroll
   for (int i0 = 0; i0 < I; i0 += NWARPS*rows_per_warp) {
-    const int i = i0 + threadIdx.y*rows_per_warp + threadIdx.x/blocks_per_tile_x_row;
+    const int i = i0 + hipThreadIdx_y*rows_per_warp + hipThreadIdx_x/blocks_per_tile_x_row;
     const block_q8_0* bxi = (const block_q8_0*)x + kbx0 + i*stride + kbxd;
     x_df[i*sram_stride + kbxd] = float(bxi->d);
   }
@@ -559,14 +586,14 @@ __device__ __forceinline__ void vec_dot_q8_0_16_q8_1_mma(const int* x, const int
   constexpr int rows_per_warp = (J >= 48 && J % 16 == 0) ? 32 : 16;
   constexpr int ntx = rows_per_warp / tile_C::I;
 
-  y += (threadIdx.y % ntx) * (tile_C::J * MMQ_TILE_Y_K);
+  y += (hipThreadIdx_y % ntx) * (tile_C::J * MMQ_TILE_Y_K);
 
   const int*   x_qs = (const int*)x;
   const float* x_df = (const float*)x_qs + 2*MMQ_TILE_NE_K;
   const int*   y_qs = (const int*)y + 4;
   const float* y_df = (const float*)y;
 
-  const int i0 = (threadIdx.y / ntx) * (ntx * tile_A::I);
+  const int i0 = (hipThreadIdx_y / ntx) * (ntx * tile_A::I);
 
   tile_A A[ntx][8];
   float dA[ntx][tile_C::ne/2][8];
@@ -628,7 +655,7 @@ __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma(const int* x, const int* y
   constexpr int rows_per_warp = (J >= 48 && J % 16 == 0) ? 32 : 16;
   constexpr int ntx = rows_per_warp / tile_C::I;
 
-  y += (threadIdx.y % ntx) * (tile_C::J * MMQ_TILE_Y_K);
+  y += (hipThreadIdx_y % ntx) * (tile_C::J * MMQ_TILE_Y_K);
 
   const int*   x_qs = (const int*)x;
   const half2* x_dm = (const half2*)x_qs + 2*MMQ_TILE_NE_K;
@@ -638,7 +665,7 @@ __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma(const int* x, const int* y
   tile_A A[ntx][MMQ_TILE_NE_K/QI8_1];
   float2 dmA[ntx][tile_C::ne/2][MMQ_TILE_NE_K/QI8_1];
 
-  const int i0 = (threadIdx.y / ntx) * rows_per_warp;
+  const int i0 = (hipThreadIdx_y / ntx) * rows_per_warp;
 
 #pragma unroll
   for (int n = 0; n < ntx; ++n) {
@@ -693,13 +720,13 @@ __device__ __forceinline__ void vec_dot_q6_K_q8_1_mma(const int* x, const int* y
   constexpr int sram_stride = SRAM_STRIDE_Q6_K;
   constexpr int rows_per_warp = (J >= 48 && J % 16 == 0) ? 32 : 16;
   constexpr int ntx = rows_per_warp / tile_C::I;
-  y += (threadIdx.y % ntx) * (tile_C::J * MMQ_TILE_Y_K);
+  y += (hipThreadIdx_y % ntx) * (tile_C::J * MMQ_TILE_Y_K);
   const int* x_qs = x;
   const float* x_df = reinterpret_cast<const float*>(x_qs + 2 * MMQ_TILE_NE_K);
   const int* x_sc = reinterpret_cast<const int*>(x_df + 1);
   const int* y_qs = y + 4;
   const float* y_df = reinterpret_cast<const float*>(y);
-  const int i0 = (threadIdx.y / ntx) * (ntx * tile_A::I);
+  const int i0 = (hipThreadIdx_y / ntx) * (ntx * tile_A::I);
   tile_A A[ntx][8];
   int scA[ntx][tile_C::ne / 2][8];
   float dA[ntx][tile_C::ne / 2];
@@ -781,7 +808,7 @@ __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma(const int* x, const int* y
   constexpr int rows_per_warp = (J >= 48 && J % 16 == 0) ? 32 : 16;
   constexpr int ntx = rows_per_warp / tile_C::I;
 
-  y += (threadIdx.y % ntx) * (tile_C::J * MMQ_TILE_Y_K);
+  y += (hipThreadIdx_y % ntx) * (tile_C::J * MMQ_TILE_Y_K);
 
   const int*   x_qs = x;
   const float* x_df = (const float*)x_qs + 2*MMQ_TILE_NE_K;
@@ -791,7 +818,7 @@ __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma(const int* x, const int* y
   tile_A A[ntx][MMQ_TILE_NE_K/QI8_0];
   float dA[ntx][tile_C::ne/2][MMQ_TILE_NE_K/QI8_0];
 
-  const int i0 = (threadIdx.y / ntx) * rows_per_warp;
+  const int i0 = (hipThreadIdx_y / ntx) * rows_per_warp;
 
 #pragma unroll
   for (int n = 0; n < ntx; ++n) {
@@ -857,14 +884,14 @@ __device__ __forceinline__ void write_back_mma(const float* sum, float* dst, int
   typedef tile<16, 8> tile_C;
   constexpr int rows_per_warp = (J >= 48 && J % 16 == 0) ? 32 : 16;
   constexpr int ntx = rows_per_warp / tile_C::I;
-  const int i0 = (threadIdx.y / ntx) * (ntx * tile_C::I);
+  const int i0 = (hipThreadIdx_y / ntx) * (ntx * tile_C::I);
 #pragma unroll
   for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
 #pragma unroll
     for (int n = 0; n < ntx; ++n) {
 #pragma unroll
       for (int l = 0; l < tile_C::ne; ++l) {
-        const int j = j0 + (threadIdx.y % ntx)*tile_C::J + tile_C::get_j(l);
+        const int j = j0 + (hipThreadIdx_y % ntx)*tile_C::J + tile_C::get_j(l);
         if (j > j_max) continue;
         const int i = i0 + n*tile_C::I + tile_C::get_i(l);
         dst[j*stride + i] = sum[(j0/tile_C::J + n)*tile_C::ne + l];
@@ -880,10 +907,10 @@ __global__ void quantize_mmq_q8_1(const float* __restrict__ x, block_q8_1_mmq* _
                                   const int K, const int n) {
   constexpr int vals_per_scale = 32;
 
-  const int64_t i0 = ((int64_t)blockDim.x*blockIdx.y + threadIdx.x)*4;
+  const int64_t i0 = ((int64_t)hipBlockDim_x*blockIdx.y + hipThreadIdx_x)*4;
   if (i0 >= K) return;
 
-  const int64_t base_idx = (int64_t)blockIdx.x * K;
+  const int64_t base_idx = (int64_t)hipBlockIdx_x * K;
   const float4* x4 = (const float4*)x;
 
   const int64_t k_block = i0 / QK8_1_MMQ;
@@ -897,7 +924,7 @@ __global__ void quantize_mmq_q8_1(const float* __restrict__ x, block_q8_1_mmq* _
 
 #pragma unroll
   for (int offset = vals_per_scale/8; offset > 0; offset >>= 1) {
-    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, 32));
+    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFFFFFFFFFull, amax, offset, 32));
   }
 
   float sum = 0.0f;
@@ -905,7 +932,7 @@ __global__ void quantize_mmq_q8_1(const float* __restrict__ x, block_q8_1_mmq* _
     sum = xi.x + xi.y + xi.z + xi.w;
 #pragma unroll
     for (int offset = vals_per_scale/8; offset > 0; offset >>= 1) {
-      sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, 32);
+      sum += __shfl_xor_sync(0xFFFFFFFFFFFFFFFFull, sum, offset, 32);
     }
   }
 
@@ -926,7 +953,7 @@ __global__ void quantize_mmq_q8_1(const float* __restrict__ x, block_q8_1_mmq* _
     d = 1.0f / d_inv;
   }
 
-  const int64_t ib = k_block*n + blockIdx.x;
+  const int64_t ib = k_block*n + hipBlockIdx_x;
   char4* yqs4 = (char4*)y[ib].qs;
   yqs4[iqs/4] = q;
 
@@ -954,7 +981,7 @@ __host__ __device__ constexpr int qk_of() {
 // stream_k_fixup kernel. A block owns a contiguous range of the continuous
 // (it, jt, kb0) index space `kbc`; every iteration that covers a whole output
 // tile writes dst directly, and a block's last iteration, if it covers only
-// part of a tile, writes its partial sums to tmp_fixup[blockIdx.x*J*I]
+// part of a tile, writes its partial sums to tmp_fixup[hipBlockIdx_x*J*I]
 // instead (two blocks writing the same tile element would race). The fixup
 // kernel then adds the preceding blocks' partials into dst, walking back over
 // the blocks that end where this one starts.
@@ -966,7 +993,7 @@ __host__ __device__ constexpr int qk_of() {
 // kbc space is (it, jt, kb0) over nty*ntx*blocks_per_row.
 
 // One tile's contribution over a K range [kb0_start, kb0_stop). When `fixup`
-// is true the sums go to tmp[blockIdx.x*J*I] instead of dst (the caller's last,
+// is true the sums go to tmp[hipBlockIdx_x*J*I] instead of dst (the caller's last,
 // possibly partial, tile); the layout of that buffer is write_back_mma's dst
 // layout at stride I, which is what the fixup kernel reads.
 template <int Type, int J>
@@ -995,7 +1022,7 @@ __device__ __forceinline__ void mul_mat_q_process_tile(
       const int* by0 = y + offset_y + ncols_y * (kb0 * qk / QK8_1_MMQ) * sz;
 #pragma unroll
       for (int l0 = 0; l0 < J*MMQ_TILE_Y_K; l0 += WARP_SIZE*NWARPS) {
-        const int l = l0 + threadIdx.y*WARP_SIZE + threadIdx.x;
+        const int l = l0 + hipThreadIdx_y*WARP_SIZE + hipThreadIdx_x;
         tile_y[l] = by0[l];
       }
     }
@@ -1006,7 +1033,7 @@ __device__ __forceinline__ void mul_mat_q_process_tile(
       const int* by0 = y + offset_y + ncols_y * ((kb0 * qk / QK8_1_MMQ) * sz + sz);
 #pragma unroll
       for (int l0 = 0; l0 < J*MMQ_TILE_Y_K; l0 += WARP_SIZE*NWARPS) {
-        const int l = l0 + threadIdx.y*WARP_SIZE + threadIdx.x;
+        const int l = l0 + hipThreadIdx_y*WARP_SIZE + hipThreadIdx_x;
         tile_y[l] = by0[l];
       }
     }
@@ -1040,7 +1067,7 @@ __device__ __forceinline__ void mul_mat_q_process_tile(
 // same tile body as the stream-k/split-K kernels.
 constexpr int kMmqLaunchBoundsMinJ = 96;
 
-// Tile index from the launch geometry in launch_mul_mat_q: blockIdx.x is the
+// Tile index from the launch geometry in launch_mul_mat_q: hipBlockIdx_x is the
 // token tile (jt), blockIdx.y the weight-row tile (it).
 template <int Type, int J>
 __global__ __launch_bounds__(WARP_SIZE * NWARPS, 1)
@@ -1050,7 +1077,7 @@ void mul_mat_q_wide(const char* __restrict__ x, const int* __restrict__ y,
                     const int stride_col_dst) {
   mul_mat_q_process_tile<Type, J>(x, y, dst, nullptr, blocks_per_row,
                                   ncols_dst, ncols_y, stride_col_dst,
-                                  blockIdx.y, blockIdx.x, 0, blocks_per_row,
+                                  blockIdx.y, hipBlockIdx_x, 0, blocks_per_row,
                                   false);
 }
 
@@ -1061,7 +1088,7 @@ __global__ void mul_mat_q(const char* __restrict__ x, const int* __restrict__ y,
                           const int stride_col_dst) {
   mul_mat_q_process_tile<Type, J>(x, y, dst, nullptr, blocks_per_row,
                                   ncols_dst, ncols_y, stride_col_dst,
-                                  blockIdx.y, blockIdx.x, 0, blocks_per_row,
+                                  blockIdx.y, hipBlockIdx_x, 0, blocks_per_row,
                                   false);
 }
 
@@ -1078,8 +1105,8 @@ __global__ void mul_mat_q_stream_k(const char* __restrict__ x,
 
   // kbc == k block continuous, current index in continuous ijk space.
   const int64_t total = int64_t(ntx) * nty * blocks_per_row;
-  int kbc      = int(int64_t(blockIdx.x)     * total / gridDim.x);
-  int kbc_stop = int(int64_t(blockIdx.x + 1) * total / gridDim.x);
+  int kbc      = int(int64_t(hipBlockIdx_x)     * total / gridDim.x);
+  int kbc_stop = int(int64_t(hipBlockIdx_x + 1) * total / gridDim.x);
 
   kbc      -= (kbc      % blocks_per_row) % blocks_per_iter;
   kbc_stop -= (kbc_stop % blocks_per_row) % blocks_per_iter;
@@ -1092,7 +1119,7 @@ __global__ void mul_mat_q_stream_k(const char* __restrict__ x,
     const int jt = tmp % ntx;
     const int it = tmp / ntx;
     mul_mat_q_process_tile<Type, J>(x, y, dst,
-                                    tmp_fixup + int64_t(blockIdx.x)*(J*I),
+                                    tmp_fixup + int64_t(hipBlockIdx_x)*(J*I),
                                     blocks_per_row, ncols_dst, ncols_y,
                                     stride_col_dst, it, jt, kb0_start, kb0_stop,
                                     /*fixup=*/false);
@@ -1108,7 +1135,7 @@ __global__ void mul_mat_q_stream_k(const char* __restrict__ x,
   const int jt = tmp % ntx;
   const int it = tmp / ntx;
   mul_mat_q_process_tile<Type, J>(x, y, dst,
-                                  tmp_fixup + int64_t(blockIdx.x)*(J*I),
+                                  tmp_fixup + int64_t(hipBlockIdx_x)*(J*I),
                                   blocks_per_row, ncols_dst, ncols_y,
                                   stride_col_dst, it, jt, kb0_start, kb0_stop,
                                   /*fixup=*/true);
@@ -1138,7 +1165,7 @@ __global__ void mul_mat_q_split_k(const char* __restrict__ x,
   constexpr int qk = qk_of<Type>();
   constexpr int blocks_per_iter = MMQ_ITER_K / qk;
   const int64_t units = int64_t(ntx) * nty * parts;
-  for (int64_t u = blockIdx.x; u < units; u += gridDim.x) {
+  for (int64_t u = hipBlockIdx_x; u < units; u += gridDim.x) {
     const int it = int(u % nty);
     const int64_t r = u / nty;
     const int jt = int(r % ntx);
@@ -1161,10 +1188,10 @@ __global__ void mul_mat_q_split_k_fixup(float* __restrict__ dst,
                                         const int stride_col_dst, const int ntx,
                                         const int nty, const int parts) {
   constexpr int NWARPS_F = NWARPS / 2;
-  const int t = blockIdx.x;
+  const int t = hipBlockIdx_x;
   const int it = t % nty;
   const int jt = t / nty;
-  const int i = blockIdx.y*WARP_SIZE + threadIdx.x;
+  const int i = blockIdx.y*WARP_SIZE + hipThreadIdx_x;
   const int tiles = ntx * nty;
 
   float sum[J / NWARPS_F] = {0.0f};
@@ -1174,7 +1201,7 @@ __global__ void mul_mat_q_split_k_fixup(float* __restrict__ dst,
     const float* s = tmp_partial + int64_t(p)*tiles*(J*I) + int64_t(t)*(J*I);
 #pragma unroll
     for (int j0 = 0; j0 < J; j0 += NWARPS_F) {
-      const int j = j0 + threadIdx.y;
+      const int j = j0 + hipThreadIdx_y;
       sum[j0/NWARPS_F] += s[j*I + i];
     }
   }
@@ -1183,7 +1210,7 @@ __global__ void mul_mat_q_split_k_fixup(float* __restrict__ dst,
   const int j_max = ncols_dst - jt*J - 1;
 #pragma unroll
   for (int j0 = 0; j0 < J; j0 += NWARPS_F) {
-    const int j = j0 + threadIdx.y;
+    const int j = j0 + hipThreadIdx_y;
     if (j > j_max) return;
     dst[j*stride_col_dst + i] = sum[j0/NWARPS_F];
   }
@@ -1199,11 +1226,11 @@ __global__ void mul_mat_q_stream_k_fixup(
   constexpr int blocks_per_iter = MMQ_ITER_K / qk;
 
   float sum[J / NWARPS_F] = {0.0f};
-  const int i = blockIdx.y*WARP_SIZE + threadIdx.x;
+  const int i = blockIdx.y*WARP_SIZE + hipThreadIdx_x;
 
   const int64_t total = int64_t(ntx) * nty * blocks_per_row;
-  int kbc0      = int(int64_t(blockIdx.x)     * total / gridDim.x);
-  int kbc0_stop = int(int64_t(blockIdx.x + 1) * total / gridDim.x);
+  int kbc0      = int(int64_t(hipBlockIdx_x)     * total / gridDim.x);
+  int kbc0_stop = int(int64_t(hipBlockIdx_x + 1) * total / gridDim.x);
 
   kbc0      -= (kbc0      % blocks_per_row) % blocks_per_iter;
   kbc0_stop -= (kbc0_stop % blocks_per_row) % blocks_per_iter;
@@ -1219,7 +1246,7 @@ __global__ void mul_mat_q_stream_k_fixup(
   bool any_fixup = false;
 
   // Iterate over previous blocks and sum up the partial sums they wrote.
-  int bidx = blockIdx.x - 1;
+  int bidx = hipBlockIdx_x - 1;
   int kbc_stop = kbc0;
   while (true) {
     int kbc = int(int64_t(bidx) * total / gridDim.x);
@@ -1235,7 +1262,7 @@ __global__ void mul_mat_q_stream_k_fixup(
 
 #pragma unroll
     for (int j0 = 0; j0 < J; j0 += NWARPS_F) {
-      const int j = j0 + threadIdx.y;
+      const int j = j0 + hipThreadIdx_y;
       sum[j0/NWARPS_F] += tmp_last_tile[bidx*(J*I) + j*I + i];
     }
 
@@ -1259,7 +1286,7 @@ __global__ void mul_mat_q_stream_k_fixup(
   const int j_max = ncols_dst - jt*J - 1;
 #pragma unroll
   for (int j0 = 0; j0 < J; j0 += NWARPS_F) {
-    const int j = j0 + threadIdx.y;
+    const int j = j0 + hipThreadIdx_y;
     if (j > j_max) return;
     dst[j*stride_col_dst + i] += sum[j0/NWARPS_F];
   }
@@ -1292,18 +1319,17 @@ __host__ inline size_t mmq_q8_blocks(int K, int n) {
 // MMQ_ITER_K == 256); their D4 layout stores a float block scale, so a zeroed
 // block is a zero scale. No-op for a K that is a multiple of 256.
 __host__ inline void zero_pad_planes(const block_q8_1_mmq* y, int K, int n,
-                                     cudaStream_t stream) {
+                                     hipStream_t stream) {
   const int64_t used = K / QK8_1_MMQ;
   const int64_t planes = mmq_q8_planes(K);
   if (planes == used) return;
-  cudaMemsetAsync(const_cast<void*>(static_cast<const void*>(y) +
-                                     used * n * sizeof(block_q8_1_mmq)),
+  hipMemsetAsync(const_cast<block_q8_1_mmq*>(y) + used * n,
                   0, size_t(planes - used) * n * sizeof(block_q8_1_mmq), stream);
 }
 
 // Quantize an already-transposed activation Xt [n, K] into block_q8_1_mmq.
 template <int ds>
-__host__ void quantize_activation(const float* x, block_q8_1_mmq* y, int K, int n, cudaStream_t stream) {
+__host__ void quantize_activation(const float* x, block_q8_1_mmq* y, int K, int n, hipStream_t stream) {
   const int64_t block_num_y = (K + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
   const dim3 num_blocks(n, block_num_y, 1);
   const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
@@ -1331,14 +1357,14 @@ __host__ inline int select_J(int n) {
 
 template <int Type, int J>
 __host__ void launch_mul_mat_q(const char* w, const int* y_q8, float* dst,
-                               int M, int n, int blocks_per_row, cudaStream_t stream) {
+                               int M, int n, int blocks_per_row, hipStream_t stream) {
   constexpr int sram_stride = Type == MMQ_Q3_K ? SRAM_STRIDE_Q3_K :
                               Type == MMQ_Q6_K ? SRAM_STRIDE_Q6_K :
                               (Type == MMQ_Q5_0 || Type == MMQ_Q8_0) ? SRAM_STRIDE_LEGACY_32
                                                                     : SRAM_STRIDE_Q8_1;
   constexpr int nbytes_shared = (PAD(J*MMQ_TILE_Y_K, WARP_SIZE*NWARPS) + I*sram_stride) * 4;
   const int nty = (M + I - 1) / I;   // weight-row tiles (the blockIdx.y axis)
-  const int ntx = (n + J - 1) / J;   // token tiles (the blockIdx.x axis)
+  const int ntx = (n + J - 1) / J;   // token tiles (the hipBlockIdx_x axis)
   // Blocks are dispatched in linear blockIdx order with x fastest, so with the
   // token tile on x the (up to eight) blocks that multiply the same weight row
   // strip by different token tiles run back to back and read that strip once
@@ -1349,13 +1375,13 @@ __host__ void launch_mul_mat_q(const char* w, const int* y_q8, float* dst,
   const dim3 grid(ntx, nty, 1);
   const dim3 block(WARP_SIZE, NWARPS, 1);
   if constexpr (J >= kMmqLaunchBoundsMinJ) {
-    cudaFuncSetAttribute((const void*)mul_mat_q_wide<Type, J>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared);
+    hipFuncSetAttribute((const void*)mul_mat_q_wide<Type, J>,
+                         hipFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared);
     mul_mat_q_wide<Type, J><<<grid, block, nbytes_shared, stream>>>(
         w, y_q8, dst, blocks_per_row, n, n, M);
   } else {
-    cudaFuncSetAttribute((const void*)mul_mat_q<Type, J>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared);
+    hipFuncSetAttribute((const void*)mul_mat_q<Type, J>,
+                         hipFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared);
     mul_mat_q<Type, J><<<grid, block, nbytes_shared, stream>>>(
         w, y_q8, dst, blocks_per_row, n, n, M);
   }
@@ -1391,14 +1417,14 @@ template <int Type, int J>
 __host__ void launch_mul_mat_q_stream_k(const char* w, const int* y_q8, float* dst,
                                         float* tmp_fixup, int M, int n,
                                         int blocks_per_row, int nsm,
-                                        cudaStream_t stream) {
+                                        hipStream_t stream) {
   constexpr int sram_stride = Type == MMQ_Q3_K ? SRAM_STRIDE_Q3_K :
                               Type == MMQ_Q6_K ? SRAM_STRIDE_Q6_K :
                               (Type == MMQ_Q5_0 || Type == MMQ_Q8_0) ? SRAM_STRIDE_LEGACY_32
                                                                     : SRAM_STRIDE_Q8_1;
   constexpr int nbytes_shared = (PAD(J*MMQ_TILE_Y_K, WARP_SIZE*NWARPS) + I*sram_stride) * 4;
-  cudaFuncSetAttribute((const void*)mul_mat_q_stream_k<Type, J>,
-                       cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared);
+  hipFuncSetAttribute((const void*)mul_mat_q_stream_k<Type, J>,
+                       hipFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared);
   const StreamKGeometry g = stream_k_geometry(M, n, J, nsm);
   mul_mat_q_stream_k<Type, J>
       <<<g.nblocks, dim3(WARP_SIZE, NWARPS, 1), nbytes_shared, stream>>>(
@@ -1440,14 +1466,14 @@ template <int Type, int J>
 __host__ void launch_mul_mat_q_split_k(const char* w, const int* y_q8, float* dst,
                                        float* tmp_partial, int M, int n,
                                        int blocks_per_row, int nsm, int parts,
-                                       cudaStream_t stream) {
+                                       hipStream_t stream) {
   constexpr int sram_stride = Type == MMQ_Q3_K ? SRAM_STRIDE_Q3_K :
                               Type == MMQ_Q6_K ? SRAM_STRIDE_Q6_K :
                               (Type == MMQ_Q5_0 || Type == MMQ_Q8_0) ? SRAM_STRIDE_LEGACY_32
                                                                     : SRAM_STRIDE_Q8_1;
   constexpr int nbytes_shared = (PAD(J*MMQ_TILE_Y_K, WARP_SIZE*NWARPS) + I*sram_stride) * 4;
-  cudaFuncSetAttribute((const void*)mul_mat_q_split_k<Type, J>,
-                       cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared);
+  hipFuncSetAttribute((const void*)mul_mat_q_split_k<Type, J>,
+                       hipFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared);
   constexpr int qk = qk_of<Type>();
   constexpr int blocks_per_iter = MMQ_ITER_K / qk;
   const int iters = (blocks_per_row + blocks_per_iter - 1) / blocks_per_iter;
@@ -1473,7 +1499,7 @@ __host__ void launch_mul_mat_q_split_k(const char* w, const int* y_q8, float* ds
 // Returns false only if J dispatch failed (should not happen).
 template <int Type>
 __host__ bool mul_mat_q(const char* w, const int* y_q8, float* dst,
-                        int M, int n, int blocks_per_row, cudaStream_t stream) {
+                        int M, int n, int blocks_per_row, hipStream_t stream) {
   switch (select_J(n)) {
     case 8:   launch_mul_mat_q<Type, 8>  (w, y_q8, dst, M, n, blocks_per_row, stream); break;
     case 16:  launch_mul_mat_q<Type, 16> (w, y_q8, dst, M, n, blocks_per_row, stream); break;

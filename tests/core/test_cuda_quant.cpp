@@ -838,6 +838,7 @@ int main() {
   test_legacy_batched_q8_1_type(sbquant::QuantType::Q5_0, "q5_0", rng);
   test_legacy_batched_q8_1_type(sbquant::QuantType::Q8_0, "q8_0", rng);
 
+#if !defined(SONICBOOM_USE_ROCM)
   test_mmq_q6_type(rng);
   // Legacy mmq, K % MMQ_ITER_K == 0 (no pad plane) and K = 896 (one pad plane,
   // the shape that caught the missing activation padding: 896 = 7*128 is an odd
@@ -855,6 +856,13 @@ int main() {
   test_cublas_q6_type(rng);
   test_legacy_cublas_type(sbquant::QuantType::Q5_0, "q5_0", rng);
   test_legacy_cublas_type(sbquant::QuantType::Q8_0, "q8_0", rng);
+#else
+  // ROCm: the MMQ int8 tensor-core path and the cuBLAS-fp16 path are not
+  // ported yet (see design/rocm_porting_plan.md Phase 1/3) — mmq_enabled()
+  // returns false and the weak hipBLAS symbols are unresolved, so the
+  // MMQ/cuBLAS-only assertions below would never hold. The functional gemv /
+  // batched-gemv differential checks above already ran.
+#endif
 
   if (g_failures == 0) {
     std::cout << "test_cuda_quant OK\n";

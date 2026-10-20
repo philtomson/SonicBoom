@@ -43,6 +43,16 @@
 
 #ifdef SONICBOOM_USE_CUDA
 #include <cuda_runtime.h>
+#elif defined(SONICBOOM_USE_ROCM)
+#include <hip/hip_runtime.h>
+// ROCm's host_defines.h defines __noinline__ as a macro
+// (__attribute__((noinline))), which collides with libstdc++ 16's <format>
+// (used by <filesystem>) — [[__gnu__::__noinline__]] would expand to
+// [[__gnu__::__attribute__((noinline))]]. Undef it so any later <format>
+// parse works. We don't use __noinline__ ourselves.
+#ifdef __noinline__
+#undef __noinline__
+#endif
 #endif
 
 #include <functional>
@@ -84,6 +94,9 @@ void clear_memory_cache();
 // valid measurement could be taken (event failure, launch failure); the caller
 // keeps its default then.
 double median_launch_ms(const std::function<bool()> &launch, cudaStream_t stream,
+                        int warmups = 2, int reps = 5);
+#elif defined(SONICBOOM_USE_ROCM)
+double median_launch_ms(const std::function<bool()> &launch, hipStream_t stream,
                         int warmups = 2, int reps = 5);
 #else
 double median_launch_ms(const std::function<bool()> &launch, int warmups = 2,

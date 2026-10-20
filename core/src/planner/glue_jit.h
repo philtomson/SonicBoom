@@ -17,14 +17,16 @@
 #pragma once
 
 // The runtime half of the glue code generator (compiler/GlueCodegen.h): turn a
-// `fused_region` node's region name into a loaded CUDA kernel and launch it.
+// `fused_region` node's region name into a loaded device kernel and launch it.
 //
-// The first launch of a region (per process) compiles its PTX through MLIR,
-// then caches the text under ~/.cache/sonicboom/kernels/<region>-sm<arch>.ptx
-// so later processes skip the compilation. The module is loaded with the CUDA
-// driver (cuModuleLoadData, which JIT-translates the PTX for the device) and
-// launched on the planner's current stream, so the launch is capturable into a
-// CUDA Graph exactly like the hand-written kernels it replaces.
+// The first launch of a region (per process) compiles it through MLIR, then
+// caches the code object under ~/.cache/sonicboom/kernels/ so later processes
+// skip the compilation: <region>-sm<arch>.ptx on the CUDA backend (loaded with
+// the driver's cuModuleLoadData, which JIT-translates the PTX for the device)
+// and <region>-gfx<arch>.hsaco on the ROCm backend (an HSA code object loaded
+// with hipModuleLoadData). Either way the kernel is launched on the planner's
+// current stream, so the launch is capturable into a CUDA Graph / HIP graph
+// exactly like the hand-written kernels it replaces.
 //
 // NOT part of the public Layer 2 surface: lives under core/src/.
 
@@ -56,6 +58,8 @@ bool launch(std::string_view region, void* const* args, int blocks, int threads,
 // compiles and caches the PTX exactly like a glue region; false means the
 // shape has no generator or the compile/load failed, and the caller falls back
 // to the hand-written kernel.
+// CUDA only for now: on a ROCm build it returns false and the caller falls
+// back to the hand-written kernel.
 bool launch_attention(const compiler::AttentionShape &shape, void* const* args,
                       int grid_x, int grid_y);
 
@@ -68,6 +72,7 @@ bool launch_attention(const compiler::AttentionShape &shape, void* const* args,
 // partial buffer is [n_chunks][n_heads_q][head_dim + 2] f32 and must be
 // device-resident before capture (warmed by the first launch). False means
 // the shape has no generator or the compile/load failed.
+// CUDA only for now: on a ROCm build it returns false.
 bool launch_attention_decode(const compiler::AttentionShape &shape,
                              void* const* args, int n_chunks, int n_heads_q);
 
@@ -78,6 +83,7 @@ bool launch_attention_decode(const compiler::AttentionShape &shape,
 // first launch compiles and caches the PTX like a glue region; false means the
 // shape has no generator or the compile/load failed (the caller falls back to
 // the cuBLASLt path).
+// CUDA only for now: on a ROCm build it returns false (cuBLASLt path stays).
 bool launch_dense_gemm(const compiler::DenseGemmShape &shape, const void *x,
                        const void *w, void *y, int m, int k, int n,
                        float alpha = 1.0f);

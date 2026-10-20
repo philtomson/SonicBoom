@@ -175,6 +175,9 @@ reporter's machine.
 - CUDA toolkit 12.0 or newer and an NVIDIA GPU, compute capability 6.1 or
   newer (`__dp4a`) — 7.5 or newer for the tensor-core MMQ path. v0.0.3 is built
   and tested for **sm_86** only (RTX 30-series).
+- For the AMD backend instead of CUDA: a ROCm/HIP 7.x toolchain and an AMD GPU.
+  The port targets **gfx1151** (RDNA 3.5 — Strix Halo / Radeon 8060S). A tree is
+  built for one GPU backend, CUDA or ROCm; the CPU path is in every build.
 - GNU Guile 3.0 and
   [guile-json](https://github.com/aconchillo/guile-json) (the `(json)` module,
   used by the Guile binding for build info and by the serve front end).
@@ -240,6 +243,66 @@ GPU and the toolchain:
 ```sh
 tools/sb-report.sh --gemma your-model.gguf --no-golden --no-bench  # --json for machines
 ```
+
+### Build (AMD GPU / ROCm)
+
+The AMD backend is the second opt-in GPU backend (`SONICBOOM_USE_ROCM`,
+alongside `SONICBOOM_USE_CUDA`), not a replacement: the CPU path is in every
+build, and a tree is configured for one GPU backend. Nothing in the build
+forbids enabling both, but that combination is untested. It builds the same
+`libsonicboom.so`, with the `.hip` twins of the hand-written CUDA kernels and the
+HIP runtime in place of the CUDA runtime.
+
+```sh
+cmake -S . -B build-rocm -DCMAKE_BUILD_TYPE=Release -DSONICBOOM_USE_ROCM=ON
+cmake --build build-rocm -j
+```
+
+`CMAKE_HIP_ARCHITECTURES` defaults to `gfx1151` (Strix Halo / Radeon 8060S) and
+can be set for another AMD part, but only gfx1151 is tested. Three things are
+AMD-specific:
+
+- **LLVM/MLIR needs the AMDGPU target.** `tools/mlir/build-mlir.sh` already adds
+  it (`HOST;NVPTX;AMDGPU`), so a normal checkout needs no change; an LLVM/MLIR
+  built for the CUDA path only (NVPTX, no AMDGPU) cannot generate the AMD
+  kernels.
+- **The ROCm toolkit is needed at run time for the generated kernels**, because
+  they are HSA code objects rather than PTX and linking them is done by `lld`
+  from the toolkit. The path is baked into `libsonicboom.so` when LLVM is built
+  (`ROCM_PATH` at that point, else `/opt/rocm`) and can be overridden when
+  running with `ROCM_PATH`, `ROCM_ROOT` or `ROCM_HOME`:
+
+  ```sh
+  ROCM_PATH=/opt/rocm LD_LIBRARY_PATH=build-rocm/core \
+    guile -L bindings/guile/scheme
+  ```
+
+  If the path is wrong, glue-region codegen logs `lld invocation failed` and the
+  runtime falls back to the hand-written kernels, so decode still runs — it just
+  loses the generated path.
+- **hipBLAS/rocBLAS are optional.** When no `libhipblas` is present the HIP
+  kernels use SonicBoom's own GEMV; not linking it also keeps ROCm's own
+  `libLLVM`/`libclang-cpp` out of the process, which otherwise collides with the
+  statically linked project LLVM (v23 vs v24) and corrupts the heap. Both layers
+  of the fix are in `core/CMakeLists.txt` and `core/src/nn/hip_blas.h`.
+
+Ported so far: the hand-written kernels (elementwise, quantized matvec/MMQ) and
+the generated fused glue regions — the six decode-step norm, quantize, RoPE and
+activation fusions are generated through MLIR/ROCDL and loaded as HSACOs, the
+same path that generates them as PTX on CUDA. Generated prefill/decode attention
+and the dense GEMM are still CUDA-only and fall back to the hand-written kernels
+on AMD. `docs/rocm_porting_plan.md` is the record of the port and what is left.
+
+The test suite runs the same way, and the glue codegen has its own AMD test:
+
+```sh
+ctest --test-dir build-rocm --output-on-failure
+ctest --test-dir build-rocm -R test_glue_hsaco -V
+```
+
+`test_glue_hsaco` compiles all six regions to HSACOs, loads them through HIP and
+checks the results against CPU references; it skips itself when no AMD GPU is
+present.
 
 ### Run (Guile)
 
@@ -372,7 +435,10 @@ Its limits:
   trust about which SMs it contains. One community report ran on an RTX 4060 Ti
   (Ada) with decode tokens identical to the sm_86 results, see
   [Community results](#community-results). A CPU path exists but is a reference
-  implementation, not a fast one.
+  implementation, not a fast one. An AMD backend (ROCm/HIP, gfx1151) exists as a
+  parallel opt-in build — see [Build (AMD GPU / ROCm)](#build-amd-gpu--rocm) —
+  with the hand-written kernels and the generated glue regions ported; the
+  README's numbers above are all CUDA sm_86.
 - **Sampling:** greedy only. `temperature`, `top_p` and `top_k` return
   `SB_ERR_UNSUPPORTED`.
 - **Chat template:** the serving layer picks the format from the loaded

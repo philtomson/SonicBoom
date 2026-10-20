@@ -28,15 +28,30 @@
 #include <sonicboom/planner/plan_record.h>
 #include <sonicboom/quant/quantized_matmul_cuda.h>
 
-#include "../nn/cuda_graph.h"
 #include "../nn/cuda_resident.h"
-#include "../nn/cuda_stream.h"
 #include "../quant/cuda_resident.h"
 #include "device_allocator.h"
 #include "device_pool.h"
 #include "glue_jit.h"
 
+#if defined(SONICBOOM_USE_CUDA)
+#include "../nn/cuda_graph.h"
+#include "../nn/cuda_stream.h"
 #include <nvToolsExt.h>
+namespace sbstream = sonicboom::cuda;
+#define SB_DEV_MEMCPY_H2D cudaMemcpyAsync
+#define SB_DEV_MEMCPY_H2D_KIND cudaMemcpyHostToDevice
+#define SB_DEV_OK cudaSuccess
+#elif defined(SONICBOOM_USE_ROCM)
+#include "../nn/hip_graph.h"
+#include "../nn/hip_stream.h"
+namespace sbstream = sonicboom::hip;
+inline void nvtxRangePushA(const char*) {}
+inline void nvtxRangePop() {}
+#define SB_DEV_MEMCPY_H2D hipMemcpyAsync
+#define SB_DEV_MEMCPY_H2D_KIND hipMemcpyHostToDevice
+#define SB_DEV_OK hipSuccess
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -131,14 +146,14 @@ class CudaStepProgram final : public hal::StepProgram {
   bool stage_upload(const hal::Buffer& dst, const void* host,
                     uint64_t bytes) override {
     if (dst.id == 0 || (!host && bytes != 0)) return false;
-    return cudaMemcpyAsync(reinterpret_cast<void*>(dst.id), host, bytes,
-                           cudaMemcpyHostToDevice, graph_.stream()) == cudaSuccess;
+    return SB_DEV_MEMCPY_H2D(reinterpret_cast<void*>(dst.id), host, bytes,
+                           SB_DEV_MEMCPY_H2D_KIND, graph_.stream()) == SB_DEV_OK;
   }
 
-  sonicboom::cuda::GraphStep& graph() { return graph_; }
+  sbstream::GraphStep& graph() { return graph_; }
 
  private:
-  sonicboom::cuda::GraphStep graph_;
+  sbstream::GraphStep graph_;
 };
 
 } // namespace
@@ -329,8 +344,8 @@ std::unique_ptr<hal::StepProgram> SonicCudaBackend::record_step(
   if (!gs.begin()) return nullptr;
   bool captured = false;
   {
-    sonicboom::cuda::CaptureScope cap;
-    sonicboom::cuda::StreamScope ss(gs.stream());
+    sbstream::CaptureScope cap;
+    sbstream::StreamScope ss(gs.stream());
     captured = step_fn();
   }
   if (!captured || !gs.end()) return nullptr;

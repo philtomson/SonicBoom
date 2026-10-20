@@ -28,6 +28,11 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # CUDA runtime. cuDNN / MAGMA / cutlass remain disabled (see the CUDA plan).
 option(SONICBOOM_USE_CUDA "Enable CUDA support (native-torch CUDA kernels)" OFF)
 
+# ROCm / HIP (AMD GPUs) is a parallel backend to CUDA. Opt-in
+# (SONICBOOM_USE_ROCM=ON); targets the Strix Halo iGPU (gfx1151). The HIP
+# kernel sources are the `.hip` twins of the `.cu` files, gated the same way.
+option(SONICBOOM_USE_ROCM "Enable ROCm/HIP support (AMD GPUs, gfx1151)" OFF)
+
 # Vulkan is a community target. This option only builds the Vulkan *stub*
 # (VulkanBackend: a Backend subclass with zero kernels — no real Vulkan compute,
 # no Vulkan loader linked). It is OFF by default and exercises only the backend
@@ -57,6 +62,17 @@ if(SONICBOOM_USE_CUDA)
   # so kernel execution is unaffected while libsonicboom.so loses most of the
   # native-torch ATen kernel image size (~70% of .nv_fatbin in a sample TU).
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xfatbin -compress-all")
+endif()
+
+# ROCm / HIP. Default the offload arch to gfx1151 (Strix Halo iGPU); override
+# with -DCMAKE_HIP_ARCHITECTURES=<arch>. HIP sources are compiled by hipcc
+# (clang-based) and use C++20 host code like the CUDA path.
+if(SONICBOOM_USE_ROCM)
+  if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
+    set(CMAKE_HIP_ARCHITECTURES gfx1151 CACHE STRING "HIP offload archs (gfx1151 = Strix Halo)")
+  endif()
+  enable_language(HIP)
+  find_package(hip REQUIRED)
 endif()
 
 # SonicCross build-time code generator for the native-torch sources (matches

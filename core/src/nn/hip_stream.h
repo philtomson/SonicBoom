@@ -1,0 +1,68 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Nala Ginrut <roy@hardenedlinux.org>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+#pragma once
+
+#include <hip/hip_runtime.h>
+
+// HIP twin of cuda_stream.h. Internal per-thread "current HIP stream" for the
+// device-resident HIP kernels (the ROCm port of the *_dev primitives in
+// cuda_elementwise.cu / cuda_quant_matmul.cu). Defaults to the legacy default
+// stream (hipStreamLegacy) so without a StreamScope the kernels behave exactly
+// as before (all work on stream 0).
+//
+// NOT part of the public Layer 2 surface: lives under core/src/.
+
+namespace sonicboom::hip {
+
+inline hipStream_t& sb_current_stream() {
+  static thread_local hipStream_t s = hipStreamLegacy;
+  return s;
+}
+
+// RAII: push `stream` as the current stream for the scope, restore on exit.
+class StreamScope {
+ public:
+  explicit StreamScope(hipStream_t stream) : prev_(sb_current_stream()) {
+    sb_current_stream() = stream;
+  }
+  ~StreamScope() { sb_current_stream() = prev_; }
+  StreamScope(const StreamScope&) = delete;
+  StreamScope& operator=(const StreamScope&) = delete;
+
+ private:
+  hipStream_t prev_;
+};
+
+inline bool& sb_capturing() {
+  static thread_local bool b = false;
+  return b;
+}
+
+// RAII: mark the current thread as capturing a HIP graph for the scope (the
+// HIP analog of CUDA-Graph capture).
+class CaptureScope {
+ public:
+  CaptureScope() : prev_(sb_capturing()) { sb_capturing() = true; }
+  ~CaptureScope() { sb_capturing() = prev_; }
+  CaptureScope(const CaptureScope&) = delete;
+  CaptureScope& operator=(const CaptureScope&) = delete;
+
+ private:
+  bool prev_;
+};
+
+}  // namespace sonicboom::hip

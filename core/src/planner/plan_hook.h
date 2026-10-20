@@ -23,7 +23,16 @@
 
 #include <sonicboom/planner/plan_record.h>
 
+#if defined(SONICBOOM_USE_CUDA)
 #include <cuda_runtime.h>
+#elif defined(SONICBOOM_USE_ROCM)
+#include <hip/hip_runtime.h>
+// See autotune.h: ROCm defines __noinline__ as a macro that collides with
+// libstdc++ 16's <format> ([[__gnu__::__noinline__]]). Undef it here too.
+#ifdef __noinline__
+#undef __noinline__
+#endif
+#endif
 
 #include <cstdint>
 #include <cstdio>

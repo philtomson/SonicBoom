@@ -20,8 +20,10 @@ PREFIX="$ROOT/build/llvm-mlir-install"
 
 # Map the host architecture to the LLVM target name. `LLVM_TARGETS_TO_BUILD`
 # accepts concrete target names (not "Native"/"host") in this LLVM version.
-# NVPTX is always added so the install can emit PTX for the GPU backend; it is a
-# pure codegen target (no CUDA toolchain is needed at build time).
+# NVPTX is always added so the install can emit PTX for the NVIDIA backend; it
+# is a pure codegen target (no CUDA toolchain is needed at build time).
+# AMDGPU is added for the ROCm/HIP backend (gfx1151, Strix Halo); it is also a
+# pure codegen target (no ROCm toolchain needed at build time).
 case "$(uname -m)" in
   x86_64|amd64)   HOST_TARGET=X86 ;;
   aarch64|arm64)  HOST_TARGET=AArch64 ;;
@@ -30,10 +32,10 @@ esac
 
 cmake -S "$SRC" -B "$BUILD" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_COMPILER=gcc-13 \
-  -DCMAKE_CXX_COMPILER=g++-13 \
+  -DCMAKE_C_COMPILER="${CC:-${SB_C_COMPILER:-clang-22}}" \
+  -DCMAKE_CXX_COMPILER="${CXX:-${SB_CXX_COMPILER:-clang++-22}}" \
   -DLLVM_ENABLE_PROJECTS=mlir \
-  -DLLVM_TARGETS_TO_BUILD="$HOST_TARGET;NVPTX" \
+  -DLLVM_TARGETS_TO_BUILD="$HOST_TARGET;NVPTX;AMDGPU" \
   -DLLVM_INCLUDE_TESTS=OFF \
   -DLLVM_INCLUDE_EXAMPLES=OFF \
   -DLLVM_INCLUDE_BENCHMARKS=OFF \

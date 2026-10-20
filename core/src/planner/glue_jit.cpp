@@ -20,6 +20,7 @@
 #include <sonicboom/compiler/GlueCodegen.h>
 #include <sonicboom/planner/plan_record.h>
 
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -36,50 +37,20 @@
 #include <cuda_runtime.h>
 
 #include "../nn/cuda_stream.h"
+#elif SONICBOOM_USE_ROCM
+#include <hip/hip_runtime.h>
+
+#include "../nn/hip_stream.h"
 #endif
 
 namespace sonicboom::planner::glue {
 namespace {
 
-#if SONICBOOM_USE_CUDA
+// --- shared cache helpers (backend-agnostic) -------------------------------
 
-struct LoadedKernel {
-  CUmodule module = nullptr;
-  CUfunction function = nullptr;
-  // Second entry of a decode module (fa_combine); null for prefill kernels.
-  CUfunction function2 = nullptr;
-};
-
-// Loaded modules live for the process: a module unload is not needed for a
-// 3-7 KiB PTX kernel, and keeping it avoids a lifetime race with a captured
-// graph that references the function.
 std::mutex &cache_mutex() {
   static std::mutex m;
   return m;
-}
-
-std::unordered_map<std::string, LoadedKernel> &kernel_cache() {
-  static std::unordered_map<std::string, LoadedKernel> cache;
-  return cache;
-}
-
-int sm_arch() {
-  int major = 0, minor = 0;
-  if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0) !=
-          cudaSuccess ||
-      cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, 0) !=
-          cudaSuccess)
-    return 0;
-  return major * 10 + minor;
-}
-
-std::filesystem::path cache_path(const std::string &region, int arch) {
-  const char *home = std::getenv("HOME");
-  std::filesystem::path dir =
-      home != nullptr ? std::filesystem::path(home) / ".cache" / "sonicboom" /
-                            "kernels"
-                      : std::filesystem::path("/tmp") / "sonicboom-kernels";
-  return dir / (region + "-sm" + std::to_string(arch) + ".ptx");
 }
 
 std::string read_file(const std::filesystem::path &path) {
@@ -120,13 +91,13 @@ std::string hex64(uint64_t v) {
 // A cache entry is one header line plus the kernel text:
 //
 //   # sb-glue-ptx 1 region=<name> arch=<cc> codegen=<id> hash=<fnv1a64>
-//   <ptx>
+//   <ptx-or-hsaco>
 //
-// The hash covers the body. The file name (region-sm<cc>.ptx) stays stable so
-// a warm entry is found without generating first; the header is what makes a
-// stale entry detectable — an entry written by another compiler, for another
-// arch, in the old headerless format, or with a body that does not match its
-// hash is ignored and regenerated.
+// The hash covers the body. The file name (region-sm<cc>.ptx / -gfx<arch>.hsaco)
+// stays stable so a warm entry is found without generating first; the header is
+// what makes a stale entry detectable — an entry written by another compiler,
+// for another arch, in the old headerless format, or with a body that does not
+// match its hash is ignored and regenerated.
 std::string make_entry(const std::string &region, int arch,
                        const std::string &codegen, const std::string &body) {
   std::string text = "# sb-glue-ptx 1 region=" + region +
@@ -158,6 +129,42 @@ std::string validate_entry(const std::string &text, const std::string &region,
   if (field("codegen") != codegen) return {};
   if (field("hash") != hex64(fnv1a64(body))) return {};
   return body;
+}
+
+#if SONICBOOM_USE_CUDA
+
+struct LoadedKernel {
+  CUmodule module = nullptr;
+  CUfunction function = nullptr;
+  // Second entry of a decode module (fa_combine); null for prefill kernels.
+  CUfunction function2 = nullptr;
+};
+
+std::unordered_map<std::string, LoadedKernel> &kernel_cache() {
+  static std::unordered_map<std::string, LoadedKernel> cache;
+  return cache;
+}
+
+// Loaded modules live for the process: a module unload is not needed for a
+// 3-7 KiB PTX kernel, and keeping it avoids a lifetime race with a captured
+// graph that references the function.
+int sm_arch() {
+  int major = 0, minor = 0;
+  if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0) !=
+          cudaSuccess ||
+      cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, 0) !=
+          cudaSuccess)
+    return 0;
+  return major * 10 + minor;
+}
+
+std::filesystem::path cache_path(const std::string &region, int arch) {
+  const char *home = std::getenv("HOME");
+  std::filesystem::path dir =
+      home != nullptr ? std::filesystem::path(home) / ".cache" / "sonicboom" /
+                            "kernels"
+                      : std::filesystem::path("/tmp") / "sonicboom-kernels";
+  return dir / (region + "-sm" + std::to_string(arch) + ".ptx");
 }
 
 // The PTX for the region on this device: the disk cache first (a warm file is
@@ -382,7 +389,100 @@ bool load_attention(const compiler::AttentionShape &shape,
   return true;
 }
 
-#endif // SONICBOOM_USE_CUDA
+#elif SONICBOOM_USE_ROCM
+
+// HIP twin of the CUDA block above. The glue-region kernels are compiled by the
+// AMDGPU backend (compiler::generate_glue_hsaco) into an HSA code object
+// (HSACO), cached on disk exactly like the PTX, loaded with hipModuleLoadData
+// and launched with hipModuleLaunchKernel on the HIP current stream.
+struct LoadedKernel {
+  hipModule_t module = nullptr;
+  hipFunction_t function = nullptr;
+};
+
+std::unordered_map<std::string, LoadedKernel> &kernel_cache() {
+  static std::unordered_map<std::string, LoadedKernel> cache;
+  return cache;
+}
+
+// The gfx architecture number (e.g. 1151 = gfx1151) for the current device.
+int gfx_arch() {
+  int arch = 0;
+  hipDeviceProp_t prop{};
+  if (hipGetDeviceProperties(&prop, 0) != hipSuccess) return 0;
+  // prop.gcnArchName is like "gfx1151"; parse the trailing digits.
+  const char *p = prop.gcnArchName;
+  const char *g = std::strstr(p, "gfx");
+  if (!g) return arch;
+  g += 3;
+  for (; std::isdigit(static_cast<unsigned char>(*g)); ++g)
+    arch = arch * 10 + (*g - '0');
+  return arch;
+}
+
+std::filesystem::path cache_path(const std::string &region, int arch) {
+  const char *home = std::getenv("HOME");
+  std::filesystem::path dir =
+      home != nullptr ? std::filesystem::path(home) / ".cache" / "sonicboom" /
+                            "kernels"
+                      : std::filesystem::path("/tmp") / "sonicboom-kernels";
+  return dir / (region + "-gfx" + std::to_string(arch) + ".hsaco");
+}
+
+// The HSACO for the region on this device: disk cache first, compiler on miss.
+std::string region_hsaco(compiler::GlueRegionKind kind, int arch) {
+  if (arch <= 0) return {};
+  const std::string region = compiler::glue_region_name(kind);
+  static const bool use_cache = [] {
+    const char *e = std::getenv("SONICBOOM_GLUE_CACHE");
+    return !(e != nullptr && std::string_view(e) == "0");
+  }();
+  const std::filesystem::path path = cache_path(region, arch);
+  if (use_cache) {
+    const std::string cached = read_file(path);
+    if (!cached.empty()) {
+      std::string body = validate_entry(cached, region, arch,
+                                        compiler::glue_codegen_version());
+      if (!body.empty()) return body;
+      std::fprintf(stderr, "glue JIT: ignoring stale HSACO cache entry %s\n",
+                   path.c_str());
+    }
+  }
+  auto generated = compiler::generate_glue_hsaco(kind, arch);
+  if (!generated) return {};
+  if (use_cache)
+    write_file(path, make_entry(region, arch, compiler::glue_codegen_version(),
+                                *generated));
+  return std::move(*generated);
+}
+
+bool load(std::string_view region, LoadedKernel &out) {
+  const auto kind = compiler::glue_region_kind_from_name(region);
+  if (!kind) return false;
+  const int arch = gfx_arch();
+  const std::string hsaco = region_hsaco(*kind, arch);
+  if (hsaco.empty()) {
+    std::fprintf(stderr, "glue JIT: no HSACO for region '%.*s'\n",
+                 int(region.size()), region.data());
+    return false;
+  }
+  if (hipModuleLoadData(&out.module, hsaco.data()) != hipSuccess) {
+    std::fprintf(stderr, "glue JIT: hipModuleLoadData failed for '%.*s'\n",
+                 int(region.size()), region.data());
+    return false;
+  }
+  if (hipModuleGetFunction(&out.function, out.module,
+                           compiler::glue_kernel_entry(*kind)) != hipSuccess) {
+    std::fprintf(stderr, "glue JIT: hipModuleGetFunction failed for '%.*s'\n",
+                 int(region.size()), region.data());
+    (void)hipModuleUnload(out.module);
+    out = {};
+    return false;
+  }
+  return true;
+}
+
+#endif // SONICBOOM_USE_CUDA / SONICBOOM_USE_ROCM
 
 } // namespace
 
@@ -428,6 +528,45 @@ bool launch(std::string_view region, void *const *args, int blocks, int threads,
   if (r != CUDA_SUCCESS) {
     std::fprintf(stderr, "glue JIT: cuLaunchKernel failed for '%.*s': %s\n",
                  int(region.size()), region.data(), cu_error(r));
+    return false;
+  }
+  return true;
+#elif SONICBOOM_USE_ROCM
+  const std::string key(region);
+  hipFunction_t function = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex());
+    auto &cache = kernel_cache();
+    auto it = cache.find(key);
+    if (it == cache.end()) {
+      LoadedKernel loaded;
+      if (!load(region, loaded)) return false;
+      it = cache.emplace(key, loaded).first;
+    }
+    function = it->second.function;
+  }
+  if (function == nullptr) return false;
+
+  if (auto *rec = sonicboom::planner::recorder()) {
+    const auto kind = compiler::glue_region_kind_from_name(region);
+    const std::string_view kernel =
+        kind ? compiler::glue_kernel_entry(*kind) : region;
+    rec->add_launch(kernel, "", unsigned(blocks), 1, 1, unsigned(threads), 1, 1,
+                    static_cast<uint64_t>(shared_bytes),
+                    reinterpret_cast<const void *>(
+                        sonicboom::hip::sb_current_stream()));
+  }
+
+  // Unlike the CUDA driver's cuLaunchKernel, hipLaunchKernel takes a host
+  // kernel symbol (it resolves the stub itself); a hipFunction_t from a loaded
+  // module must go through hipModuleLaunchKernel.
+  const hipError_t r = hipModuleLaunchKernel(
+      function, unsigned(blocks), 1, 1, unsigned(threads), 1, 1,
+      static_cast<unsigned>(shared_bytes),
+      sonicboom::hip::sb_current_stream(), const_cast<void **>(args), nullptr);
+  if (r != hipSuccess) {
+    std::fprintf(stderr, "glue JIT: hipModuleLaunchKernel failed for '%.*s': %s\n",
+                 int(region.size()), region.data(), hipGetErrorString(r));
     return false;
   }
   return true;

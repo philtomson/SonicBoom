@@ -18,9 +18,11 @@
 
 #ifdef SONICBOOM_USE_CUDA
 #include <cuda_runtime.h>
-#endif
-
 #include "../nn/cuda_stream.h"
+#elif defined(SONICBOOM_USE_ROCM)
+#include <hip/hip_runtime.h>
+#include "../nn/hip_stream.h"
+#endif
 
 #include <mutex>
 #include <unordered_map>
@@ -37,7 +39,7 @@ uint64_t align_up(uint64_t n) {
   return rem == 0 ? n : n + (kAlignment - rem);
 }
 
-#ifdef SONICBOOM_USE_CUDA
+#if defined(SONICBOOM_USE_CUDA) || defined(SONICBOOM_USE_ROCM)
 
 std::mutex g_mutex;
 bool g_checked = false;
@@ -50,11 +52,15 @@ std::unordered_map<uint64_t, std::vector<uint64_t>> g_free;
 } // namespace
 
 bool available() noexcept {
-#ifdef SONICBOOM_USE_CUDA
+#if defined(SONICBOOM_USE_CUDA) || defined(SONICBOOM_USE_ROCM)
   std::lock_guard<std::mutex> lk(g_mutex);
   if (!g_checked) {
     int n = 0;
+#if defined(SONICBOOM_USE_CUDA)
     g_available = (cudaGetDeviceCount(&n) == cudaSuccess && n > 0);
+#else
+    g_available = (hipGetDeviceCount(&n) == hipSuccess && n > 0);
+#endif
     g_checked = true;
   }
   return g_available;
@@ -64,7 +70,7 @@ bool available() noexcept {
 }
 
 uint64_t acquire(uint64_t bytes) {
-#ifdef SONICBOOM_USE_CUDA
+#if defined(SONICBOOM_USE_CUDA) || defined(SONICBOOM_USE_ROCM)
   if (bytes == 0 || !available()) return 0;
   const uint64_t size = align_up(bytes);
   std::lock_guard<std::mutex> lk(g_mutex);
@@ -75,7 +81,11 @@ uint64_t acquire(uint64_t bytes) {
     return h;
   }
   void* p = nullptr;
+#if defined(SONICBOOM_USE_CUDA)
   if (cudaMalloc(&p, size) != cudaSuccess) return 0;
+#else
+  if (hipMalloc(&p, size) != hipSuccess) return 0;
+#endif
   return reinterpret_cast<uint64_t>(p);
 #else
   (void)bytes;
@@ -84,7 +94,7 @@ uint64_t acquire(uint64_t bytes) {
 }
 
 void release(uint64_t handle, uint64_t bytes) {
-#ifdef SONICBOOM_USE_CUDA
+#if defined(SONICBOOM_USE_CUDA) || defined(SONICBOOM_USE_ROCM)
   if (handle == 0) return;
   const uint64_t size = align_up(bytes);
   std::lock_guard<std::mutex> lk(g_mutex);
@@ -96,10 +106,15 @@ void release(uint64_t handle, uint64_t bytes) {
 }
 
 bool upload(const void* host, uint64_t handle, uint64_t bytes) {
-#ifdef SONICBOOM_USE_CUDA
+#if defined(SONICBOOM_USE_CUDA) || defined(SONICBOOM_USE_ROCM)
   if (!host || handle == 0 || bytes == 0) return false;
+#if defined(SONICBOOM_USE_CUDA)
   return cudaMemcpy(reinterpret_cast<void*>(handle), host, bytes,
                     cudaMemcpyHostToDevice) == cudaSuccess;
+#else
+  return hipMemcpy(reinterpret_cast<void*>(handle), host, bytes,
+                   hipMemcpyHostToDevice) == hipSuccess;
+#endif
 #else
   (void)host; (void)handle; (void)bytes;
   return false;
@@ -107,15 +122,21 @@ bool upload(const void* host, uint64_t handle, uint64_t bytes) {
 }
 
 bool download(uint64_t handle, void* host, uint64_t bytes) {
-#ifdef SONICBOOM_USE_CUDA
+#if defined(SONICBOOM_USE_CUDA) || defined(SONICBOOM_USE_ROCM)
   if (!host || handle == 0 || bytes == 0) return false;
-  // A synchronous cudaMemcpy cannot be recorded into a CUDA graph. Under
-  // capture (see cuda::CaptureScope) skip the copy: the caller recovers the
-  // result from a persistent device slot after replay, so the graph records
-  // only the capturable device work.
+  // A synchronous memcpy cannot be recorded into a graph. Under capture (see
+  // the backend CaptureScope) skip the copy: the caller recovers the result
+  // from a persistent device slot after replay, so the graph records only the
+  // capturable device work.
+#if defined(SONICBOOM_USE_CUDA)
   if (sonicboom::cuda::sb_capturing()) return true;
   return cudaMemcpy(host, reinterpret_cast<const void*>(handle), bytes,
                     cudaMemcpyDeviceToHost) == cudaSuccess;
+#else
+  if (sonicboom::hip::sb_capturing()) return true;
+  return hipMemcpy(host, reinterpret_cast<const void*>(handle), bytes,
+                   hipMemcpyDeviceToHost) == hipSuccess;
+#endif
 #else
   (void)handle; (void)host; (void)bytes;
   return false;
@@ -123,12 +144,19 @@ bool download(uint64_t handle, void* host, uint64_t bytes) {
 }
 
 bool device_copy(uint64_t src, uint64_t dst, uint64_t bytes) {
-#ifdef SONICBOOM_USE_CUDA
+#if defined(SONICBOOM_USE_CUDA) || defined(SONICBOOM_USE_ROCM)
   if (src == 0 || dst == 0 || bytes == 0) return false;
+#if defined(SONICBOOM_USE_CUDA)
   return cudaMemcpyAsync(reinterpret_cast<void*>(dst),
                          reinterpret_cast<const void*>(src), bytes,
                          cudaMemcpyDeviceToDevice,
                          sonicboom::cuda::sb_current_stream()) == cudaSuccess;
+#else
+  return hipMemcpyAsync(reinterpret_cast<void*>(dst),
+                        reinterpret_cast<const void*>(src), bytes,
+                        hipMemcpyDeviceToDevice,
+                        sonicboom::hip::sb_current_stream()) == hipSuccess;
+#endif
 #else
   (void)src; (void)dst; (void)bytes;
   return false;
@@ -136,10 +164,15 @@ bool device_copy(uint64_t src, uint64_t dst, uint64_t bytes) {
 }
 
 bool memset_device(uint64_t handle, int value, uint64_t bytes) {
-#ifdef SONICBOOM_USE_CUDA
+#if defined(SONICBOOM_USE_CUDA) || defined(SONICBOOM_USE_ROCM)
   if (handle == 0 || bytes == 0) return false;
+#if defined(SONICBOOM_USE_CUDA)
   return cudaMemsetAsync(reinterpret_cast<void*>(handle), value, bytes,
                          sonicboom::cuda::sb_current_stream()) == cudaSuccess;
+#else
+  return hipMemsetAsync(reinterpret_cast<void*>(handle), value, bytes,
+                        sonicboom::hip::sb_current_stream()) == hipSuccess;
+#endif
 #else
   (void)handle; (void)value; (void)bytes;
   return false;
@@ -147,19 +180,28 @@ bool memset_device(uint64_t handle, int value, uint64_t bytes) {
 }
 
 bool synchronize() {
-#ifdef SONICBOOM_USE_CUDA
+#if defined(SONICBOOM_USE_CUDA) || defined(SONICBOOM_USE_ROCM)
+#if defined(SONICBOOM_USE_CUDA)
   return cudaStreamSynchronize(0) == cudaSuccess;
+#else
+  return hipStreamSynchronize(0) == hipSuccess;
+#endif
 #else
   return false;
 #endif
 }
 
 void clear_all() {
-#ifdef SONICBOOM_USE_CUDA
+#if defined(SONICBOOM_USE_CUDA) || defined(SONICBOOM_USE_ROCM)
   std::lock_guard<std::mutex> lk(g_mutex);
   for (auto& kv : g_free)
-    for (uint64_t h : kv.second)
+    for (uint64_t h : kv.second) {
+#if defined(SONICBOOM_USE_CUDA)
       cudaFree(reinterpret_cast<void*>(h));
+#else
+      hipFree(reinterpret_cast<void*>(h));
+#endif
+    }
   g_free.clear();
 #endif
 }

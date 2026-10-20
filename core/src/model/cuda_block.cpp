@@ -23,7 +23,27 @@
 #include "../nn/cuda_resident.h"
 #include "../quant/cuda_resident.h"
 
+#if defined(SONICBOOM_USE_CUDA)
 #include <cuda_runtime.h>
+#define SB_DEV_MALLOC(p, n) (cudaMalloc((p), (n)) == cudaSuccess)
+#define SB_DEV_FREE(p) cudaFree(p)
+#define SB_DEV_COPY_H2D(dst, src, n) \
+  (cudaMemcpy((dst), (src), (n), cudaMemcpyHostToDevice) == cudaSuccess)
+#define SB_DEV_COPY_D2D(dst, src, n) \
+  (cudaMemcpy((dst), (src), (n), cudaMemcpyDeviceToDevice) == cudaSuccess)
+#define SB_DEV_COPY_D2H(dst, src, n) \
+  (cudaMemcpy((dst), (src), (n), cudaMemcpyDeviceToHost) == cudaSuccess)
+#elif defined(SONICBOOM_USE_ROCM)
+#include <hip/hip_runtime.h>
+#define SB_DEV_MALLOC(p, n) (hipMalloc((p), (n)) == hipSuccess)
+#define SB_DEV_FREE(p) hipFree(p)
+#define SB_DEV_COPY_H2D(dst, src, n) \
+  (hipMemcpy((dst), (src), (n), hipMemcpyHostToDevice) == hipSuccess)
+#define SB_DEV_COPY_D2D(dst, src, n) \
+  (hipMemcpy((dst), (src), (n), hipMemcpyDeviceToDevice) == hipSuccess)
+#define SB_DEV_COPY_D2H(dst, src, n) \
+  (hipMemcpy((dst), (src), (n), hipMemcpyDeviceToHost) == hipSuccess)
+#endif
 
 #include <utility>
 #include <vector>
@@ -88,12 +108,12 @@ void free_buf(DevBuf& b) {
                  b.inp_ple,      b.g0,         b.g1,         b.g2,
                  b.x3,           b.out,        b.donor_swa,  b.donor_global};
   for (float* p : ps)
-    if (p) cudaFree(p);
+    if (p) SB_DEV_FREE(p);
   b = DevBuf{};
 }
 
 bool alloc_float(float*& p, int n) {
-  return cudaMalloc(reinterpret_cast<void**>(&p), (size_t)n * sizeof(float)) == cudaSuccess;
+  return SB_DEV_MALLOC(reinterpret_cast<void**>(&p), (size_t)n * sizeof(float));
 }
 
 bool ensure_buffers(const Gemma4Model& m) {
@@ -138,9 +158,7 @@ bool cuda_forward_resident(const Gemma4Model& m, uint64_t token_id, uint64_t pos
   // Token embedding (host reference) -> device residual stream.
   std::vector<float> inpL(d);
   if (!embed_token(m, token_id, inpL)) return false;
-  if (cudaMemcpy(g_buf.inp, inpL.data(), d * sizeof(float), cudaMemcpyHostToDevice) !=
-      cudaSuccess)
-    return false;
+  if (!SB_DEV_COPY_H2D(g_buf.inp, inpL.data(), d * sizeof(float))) return false;
 
   const uint32_t n_kv = m.config.n_layer_kv();
   const uint32_t donor_swa_layer = n_kv - 2;
@@ -190,12 +208,10 @@ bool cuda_forward_resident(const Gemma4Model& m, uint64_t token_id, uint64_t pos
       if (!nn::cuda::gqa_broadcast_dev(g_buf.v, g_buf.attn, n_q, n_kvh, hd)) return false;
       // Retain the fp16-normalized V of the two donor layers for the shared layers.
       if (l == donor_swa_layer) {
-        if (cudaMemcpy(g_buf.donor_swa, g_buf.v, kvw * sizeof(float),
-                       cudaMemcpyDeviceToDevice) != cudaSuccess)
+        if (!SB_DEV_COPY_D2D(g_buf.donor_swa, g_buf.v, kvw * sizeof(float)))
           return false;
       } else if (l == donor_global_layer) {
-        if (cudaMemcpy(g_buf.donor_global, g_buf.v, kvw * sizeof(float),
-                       cudaMemcpyDeviceToDevice) != cudaSuccess)
+        if (!SB_DEV_COPY_D2D(g_buf.donor_global, g_buf.v, kvw * sizeof(float)))
           return false;
       }
     } else {
@@ -223,8 +239,7 @@ bool cuda_forward_resident(const Gemma4Model& m, uint64_t token_id, uint64_t pos
 
     // --- per-layer gate --------------------------------------------------------
     if (!embed_per_layer(m, l, token_id, inp_ple_host, true)) return false;
-    if (cudaMemcpy(g_buf.inp_ple, inp_ple_host.data(), per * sizeof(float),
-                   cudaMemcpyHostToDevice) != cudaSuccess)
+    if (!SB_DEV_COPY_H2D(g_buf.inp_ple, inp_ple_host.data(), per * sizeof(float)))
       return false;
     if (!nn::cuda::matvec_f32_dev(bw.inp_gate, d, g_buf.x2, g_buf.g0, per)) return false;
     if (!nn::cuda::gelu_fp16_dev(g_buf.g0, g_buf.g0, per)) return false;
@@ -236,9 +251,7 @@ bool cuda_forward_resident(const Gemma4Model& m, uint64_t token_id, uint64_t pos
       if (!nn::cuda::scale_dev(g_buf.x3, bw.layer_output_scale[0], g_buf.out, d))
         return false;
     } else {
-      if (cudaMemcpy(g_buf.out, g_buf.x3, d * sizeof(float), cudaMemcpyDeviceToDevice) !=
-          cudaSuccess)
-        return false;
+      if (!SB_DEV_COPY_D2D(g_buf.out, g_buf.x3, d * sizeof(float))) return false;
     }
 
     // Residual stream: this block's out becomes the next block's input.
@@ -246,9 +259,7 @@ bool cuda_forward_resident(const Gemma4Model& m, uint64_t token_id, uint64_t pos
   }
 
   // The final residual is the last block's l_out.
-  if (cudaMemcpy(out.data(), g_buf.inp, d * sizeof(float), cudaMemcpyDeviceToHost) !=
-      cudaSuccess)
-    return false;
+  if (!SB_DEV_COPY_D2H(out.data(), g_buf.inp, d * sizeof(float))) return false;
   return true;
 }
 
