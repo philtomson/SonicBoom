@@ -33,7 +33,7 @@
 #include <sonicboom/nn/sampling.h>
 #include <sonicboom/quant/dequant.h>
 #include <sonicboom/quant/quantized_matmul.h>
-#ifdef SONICBOOM_USE_CUDA
+#if defined(SONICBOOM_USE_CUDA) || defined(SONICBOOM_USE_ROCM)
 #include <sonicboom/nn/cuda_elementwise.h>
 #include "cuda_block.h"
 #endif
@@ -70,55 +70,58 @@ struct ScopeTimer {
   ~ScopeTimer() { *sink += prof_now_ms() - t0; }
 };
 
-// Per-op dispatch: route to the CUDA kernel when `use_cuda` is set (Cuda backend
-// active AND a device present), else fall through to the CPU reference. Each
-// nn::cuda::* mirrors the matching nn::* signature and reproduces its arithmetic
-// to fp32 tolerance (the CPU reference accumulates mean/matvec in double while
-// the kernel accumulates in fp32 — the same relaxation the K-quant CUDA gemv
-// makes). These are file-local: the model layer is the only consumer.
-#ifdef SONICBOOM_USE_CUDA
-static bool rms_norm_d(bool use_cuda, std::span<const float> x,
+// Per-op dispatch: route to the device kernel when `use_gpu` is set (the
+// MatmulBackend::Cuda backend is active AND a device is present), else fall
+// through to the CPU reference. `nn::cuda::*` is the device namespace on both
+// GPU backends (the HIP twin of cuda_elementwise.cu defines the same symbols),
+// so this layer is backend-neutral; only the build guard names the two. Each
+// kernel mirrors the matching nn::* signature and reproduces its arithmetic to
+// fp32 tolerance (the CPU reference accumulates mean/matvec in double while the
+// kernel accumulates in fp32 — the same relaxation the K-quant gemv makes).
+// These are file-local: the model layer is the only consumer.
+#if defined(SONICBOOM_USE_CUDA) || defined(SONICBOOM_USE_ROCM)
+static bool rms_norm_d(bool use_gpu, std::span<const float> x,
                        std::span<const float> w, float eps, std::span<float> y) {
-  if (use_cuda) return nn::cuda::rms_norm(x, w, eps, y);
+  if (use_gpu) return nn::cuda::rms_norm(x, w, eps, y);
   return nn::rms_norm(x, w, eps, y);
 }
-static bool gelu_fp16_d(bool use_cuda, std::span<const float> x,
+static bool gelu_fp16_d(bool use_gpu, std::span<const float> x,
                         std::span<float> y) {
-  if (use_cuda) return nn::cuda::gelu_fp16(x, y);
+  if (use_gpu) return nn::cuda::gelu_fp16(x, y);
   return nn::gelu_fp16(x, y);
 }
-static bool mul_d(bool use_cuda, std::span<const float> a, std::span<const float> b,
+static bool mul_d(bool use_gpu, std::span<const float> a, std::span<const float> b,
                   std::span<float> y) {
-  if (use_cuda) return nn::cuda::mul(a, b, y);
+  if (use_gpu) return nn::cuda::mul(a, b, y);
   return nn::mul(a, b, y);
 }
-static bool add_d(bool use_cuda, std::span<const float> a, std::span<const float> b,
+static bool add_d(bool use_gpu, std::span<const float> a, std::span<const float> b,
                   std::span<float> y) {
-  if (use_cuda) return nn::cuda::add(a, b, y);
+  if (use_gpu) return nn::cuda::add(a, b, y);
   return nn::add(a, b, y);
 }
-static bool scale_d(bool use_cuda, std::span<const float> x, float s,
+static bool scale_d(bool use_gpu, std::span<const float> x, float s,
                     std::span<float> y) {
-  if (use_cuda) return nn::cuda::scale(x, s, y);
+  if (use_gpu) return nn::cuda::scale(x, s, y);
   return nn::scale(x, s, y);
 }
-static bool rope_heads_d(bool use_cuda, std::span<float> x, uint64_t head_dim,
+static bool rope_heads_d(bool use_gpu, std::span<float> x, uint64_t head_dim,
                          uint64_t pos, float base,
                          std::span<const float> ff) {
-  if (use_cuda) return nn::cuda::rope_neox_heads(x, head_dim, pos, base, 1.0f, ff);
+  if (use_gpu) return nn::cuda::rope_neox_heads(x, head_dim, pos, base, 1.0f, ff);
   // CPU: the per-head rotation, split across the thread pool by rope_neox_heads
   // (trig-heavy RoPE is big enough to amortise the handshake, unlike the trivial
   // elementwise ops).
   return nn::rope_neox_heads(x, head_dim, pos, base, 1.0f, ff);
 }
-static bool matvec_f32_d(bool use_cuda, std::span<const float> W, uint64_t cols,
+static bool matvec_f32_d(bool use_gpu, std::span<const float> W, uint64_t cols,
                          std::span<const float> x, std::span<float> y) {
-  if (use_cuda) return nn::cuda::matvec_f32(W, cols, x, y);
+  if (use_gpu) return nn::cuda::matvec_f32(W, cols, x, y);
   return nn::matvec_f32(W, cols, x, y);
 }
-static bool matvec_bf16_d(bool use_cuda, std::span<const uint16_t> W, uint64_t cols,
+static bool matvec_bf16_d(bool use_gpu, std::span<const uint16_t> W, uint64_t cols,
                           std::span<const float> x, std::span<float> y) {
-  if (use_cuda) return nn::cuda::matvec_bf16(W, cols, x, y);
+  if (use_gpu) return nn::cuda::matvec_bf16(W, cols, x, y);
   return nn::matvec_bf16(W, cols, x, y);
 }
 #else
@@ -165,7 +168,7 @@ bool embed_token(const Gemma4Model& m, uint64_t token_id, std::span<float> out) 
 }
 
 bool embed_per_layer(const Gemma4Model& m, uint32_t layer, uint64_t token_id,
-                     std::span<float> out, bool use_cuda) {
+                     std::span<float> out, bool use_gpu) {
   ScopeTimer _t(&g_prof.t_embed_pl);
   ++g_prof.n_embed;
   if (m.weights.blocks.empty() || layer >= m.config.block_count) return false;
@@ -201,9 +204,9 @@ bool embed_per_layer(const Gemma4Model& m, uint32_t layer, uint64_t token_id,
   // per_layer_model_proj[:, layer*per .. +per) @ inpL_bf16. The layer's `per`
   // columns are contiguous in the packed bf16 tensor (offset layer*per*d), so it
   // is one span. The projection scale is applied on the host after the matvec
-  // (the CPU reference accumulates in double, the CUDA bf16 gemv in fp32).
+  // (the CPU reference accumulates in double, the device bf16 gemv in fp32).
   const uint64_t layer_base = (uint64_t(layer) * per) * d;
-  if (!matvec_bf16_d(use_cuda, M.subspan(layer_base, uint64_t(per) * d), d,
+  if (!matvec_bf16_d(use_gpu, M.subspan(layer_base, uint64_t(per) * d), d,
                      inpL_bf16, proj))
     return false;
   for (uint32_t j = 0; j < per; ++j) proj[j] *= proj_scale;
@@ -258,10 +261,11 @@ static bool run_block_core(const Gemma4Model& m, uint32_t layer,
   const uint32_t per = m.config.per_layer_input;
   const float eps = m.config.rms_epsilon;
   const bool is_kv = m.config.has_kv(layer);
-  // Route the d/ff/qw/kvw elementwise + dense gate matvecs to CUDA when the Cuda
-  // backend is active and a device is present; small per-head loops (hd=256/512,
-  // per=256) and SDPA stay on the CPU.
-  const bool use_cuda = backend == quant::MatmulBackend::Cuda && quant::cuda_available();
+  // Route the d/ff/qw/kvw elementwise + dense gate matvecs to the device when
+  // the Cuda backend is active and a device is present; small per-head loops
+  // (hd=256/512, per=256) and SDPA stay on the CPU.
+  const bool use_gpu =
+      backend == quant::MatmulBackend::Cuda && quant::gpu_available();
 
   // Named-stage tracer matching llama.cpp's cb() convention ("<name>-<layer>").
   auto emit = [&](const char* base, std::span<const float> v) {
@@ -274,7 +278,7 @@ static bool run_block_core(const Gemma4Model& m, uint32_t layer,
   // --- attention -----------------------------------------------------------
   const double _t_attn = prof_now_ms();
   std::vector<float> h(d);
-  if (!rms_norm_d(use_cuda, inp, bw.attn_norm, eps, h)) return false;
+  if (!rms_norm_d(use_gpu, inp, bw.attn_norm, eps, h)) return false;
   emit("attn_norm", h);
 
   const uint64_t qw = uint64_t(n_q) * hd;
@@ -294,7 +298,7 @@ static bool run_block_core(const Gemma4Model& m, uint32_t layer,
       lc.attention == AttentionKind::Global ? m.weights.rope_freqs
                                             : std::span<const float>{};
   // Rotate the whole Q span in one pass (single kernel over qw when on CUDA).
-  if (!rope_heads_d(use_cuda, q, hd, pos, lc.rope_base, freq_factors)) return false;
+  if (!rope_heads_d(use_gpu, q, hd, pos, lc.rope_base, freq_factors)) return false;
   emit("Qcur_pos", q);
 
   // Gemma 4 uses scale = 1.0 (Q/K RMSNorm supplies the normalization) and no
@@ -314,7 +318,7 @@ static bool run_block_core(const Gemma4Model& m, uint32_t layer,
     emit("Vcur_normed", v);
     nn::cast_fp16(v);  // match llama.cpp flash-attn's fp16 value cast
     // Rotate the whole K span in one pass (single kernel over kvw when on CUDA).
-    if (!rope_heads_d(use_cuda, k, hd, pos, lc.rope_base, freq_factors)) return false;
+    if (!rope_heads_d(use_gpu, k, hd, pos, lc.rope_base, freq_factors)) return false;
     emit("Kcur_pos", k);
     if (!nn::scaled_dot_product_attention(q, 1, k, v, 1, n_q, n_kv, hd, true,
                                           lc.sliding_window, 0.0f, 1.0f, attn))
@@ -334,52 +338,52 @@ static bool run_block_core(const Gemma4Model& m, uint32_t layer,
   std::vector<float> attn_proj(d);
   if (!quant::matvec(bw.attn_output, attn, attn_proj, backend)) return false;
   std::vector<float> o(d);
-  if (!rms_norm_d(use_cuda, attn_proj, bw.post_attention_norm, eps, o)) return false;
+  if (!rms_norm_d(use_gpu, attn_proj, bw.post_attention_norm, eps, o)) return false;
   emit("attn_post_norm", o);
   std::vector<float> x1(d);
-  if (!add_d(use_cuda, o, inp, x1)) return false;
+  if (!add_d(use_gpu, o, inp, x1)) return false;
   emit("attn_out", x1);
 
   // --- gated feed-forward (GELU-tanh, parallel gate) -----------------------
   g_prof.t_attn += prof_now_ms() - _t_attn;
   const double _t_ffn = prof_now_ms();
   std::vector<float> f(d);
-  if (!rms_norm_d(use_cuda, x1, bw.ffn_norm, eps, f)) return false;
+  if (!rms_norm_d(use_gpu, x1, bw.ffn_norm, eps, f)) return false;
   emit("ffn_norm", f);
   std::vector<float> up(ff), gate(ff), ffn_hidden(ff);
   if (!quant::matvec(bw.ffn_up, f, up, backend)) return false;
   emit("ffn_up", up);
   if (!quant::matvec(bw.ffn_gate, f, gate, backend)) return false;
   emit("ffn_gate", gate);
-  if (!gelu_fp16_d(use_cuda, gate, gate)) return false;  // GGML_GELU_FP16 table path
-  if (!mul_d(use_cuda, gate, up, ffn_hidden)) return false;
+  if (!gelu_fp16_d(use_gpu, gate, gate)) return false;  // GGML_GELU_FP16 table path
+  if (!mul_d(use_gpu, gate, up, ffn_hidden)) return false;
   emit("ffn_geglu", ffn_hidden);
   std::vector<float> ffn_out(d);
   if (!quant::matvec(bw.ffn_down, ffn_hidden, ffn_out, backend)) return false;
   emit("ffn_out", ffn_out);
   std::vector<float> f2(d);
-  if (!rms_norm_d(use_cuda, ffn_out, bw.post_ffw_norm, eps, f2)) return false;
+  if (!rms_norm_d(use_gpu, ffn_out, bw.post_ffw_norm, eps, f2)) return false;
   emit("ffn_post_norm", f2);
   std::vector<float> x2(d);
-  if (!add_d(use_cuda, f2, x1, x2)) return false;
+  if (!add_d(use_gpu, f2, x1, x2)) return false;
   emit("pe_in", x2);
 
   // --- per-layer gate ------------------------------------------------------
   g_prof.t_ffn += prof_now_ms() - _t_ffn;
   const double _t_gate = prof_now_ms();
   std::vector<float> inp_ple(per);
-  if (!embed_per_layer(m, layer, token_id, inp_ple, use_cuda)) return false;
+  if (!embed_per_layer(m, layer, token_id, inp_ple, use_gpu)) return false;
   std::vector<float> g0(per);
-  if (!matvec_f32_d(use_cuda, bw.inp_gate, d, x2, g0)) return false;  // [d] -> [per]
-  if (!gelu_fp16_d(use_cuda, g0, g0)) return false;  // GGML_GELU_FP16 table path
+  if (!matvec_f32_d(use_gpu, bw.inp_gate, d, x2, g0)) return false;  // [d] -> [per]
+  if (!gelu_fp16_d(use_gpu, g0, g0)) return false;  // GGML_GELU_FP16 table path
   if (!nn::mul(g0, inp_ple, g0)) return false;  // * inp_per_layer[l]  (per=256: CPU)
   std::vector<float> g1(d);
-  if (!matvec_f32_d(use_cuda, bw.proj, per, g0, g1)) return false;  // [per] -> [d]
+  if (!matvec_f32_d(use_gpu, bw.proj, per, g0, g1)) return false;  // [per] -> [d]
   std::vector<float> g2(d);
-  if (!rms_norm_d(use_cuda, g1, bw.post_norm, eps, g2)) return false;
+  if (!rms_norm_d(use_gpu, g1, bw.post_norm, eps, g2)) return false;
   emit("per_layer_embd_out", g2);
   std::vector<float> x3(d);
-  if (!add_d(use_cuda, x2, g2, x3)) return false;
+  if (!add_d(use_gpu, x2, g2, x3)) return false;
 
   // Whole-block output scale (blk.%d.layer_output_scale.weight). Gemma 4 applies
   // a per-layer scalar here (e.g. 0.061/0.16/0.44 across layers); llama.cpp
@@ -387,7 +391,7 @@ static bool run_block_core(const Gemma4Model& m, uint32_t layer,
   // tensor (build_cvec is identity for gemma4), so the scale survives only as
   // "l_out". Apply the scale and emit only "l_out" to match the baseline dump.
   if (!bw.layer_output_scale.empty()) {
-    if (!scale_d(use_cuda, x3, bw.layer_output_scale[0], out)) return false;
+    if (!scale_d(use_gpu, x3, bw.layer_output_scale[0], out)) return false;
   } else {
     std::copy(x3.begin(), x3.end(), out.begin());
   }
@@ -426,12 +430,13 @@ bool forward_traced(const Gemma4Model& m, uint64_t token_id, uint64_t pos,
   const uint32_t d = m.config.embedding_length;
   if (out.size() < d) return false;
 
-#ifdef SONICBOOM_USE_CUDA
+#if defined(SONICBOOM_USE_CUDA) || defined(SONICBOOM_USE_ROCM)
   // Device-resident fast path (Phase 6a Option A): without a trace and with a
   // present device, run the whole forward with activations resident on the GPU
   // (synchronizes only at the end). The host path below remains the reference
-  // for the CPU backend and for trace-based baseline dumps.
-  if (!trace && backend == quant::MatmulBackend::Cuda && quant::cuda_available())
+  // for the CPU backend and for trace-based baseline dumps. The HIP twin
+  // (model/cuda_block.cpp) implements the same function over the HIP kernels.
+  if (!trace && backend == quant::MatmulBackend::Cuda && quant::gpu_available())
     return cuda_forward_resident(m, token_id, pos, out);
 #endif
 
@@ -504,9 +509,10 @@ bool lm_head(const Gemma4Model& m, std::span<const float> hidden,
   if (hidden.size() < d || logits.size() < m.config.vocab_size) return false;
 
   // h = rms_norm(hidden, output_norm, eps) — the "result_norm" / "h_nextn" state.
-  const bool use_cuda = backend == quant::MatmulBackend::Cuda && quant::cuda_available();
+  const bool use_gpu =
+      backend == quant::MatmulBackend::Cuda && quant::gpu_available();
   std::vector<float> h(d);
-  if (!rms_norm_d(use_cuda, hidden, m.weights.output_norm, m.config.rms_epsilon, h))
+  if (!rms_norm_d(use_gpu, hidden, m.weights.output_norm, m.config.rms_epsilon, h))
     return false;
 
   // logit = W @ h, W = the untied output projection when the file has one
@@ -556,6 +562,11 @@ uint64_t generate(const Gemma4Model& m, uint64_t start_token, uint64_t start_pos
   // Phase 6 (M4): the runtime decode path is the spine. The bespoke forward +
   // lm_head loop (generate_reference) is oracle-only; it stays reachable for the
   // f32 scalar reference, which has no spine variant.
+  //
+  // Unlike the per-op routing above, this gate stays CUDA-specific: on a ROCm
+  // build generate_spine_cuda (and generate_prefill_spine_cuda below) are the
+  // no-device stubs returning 0, so sending a ROCm device here would silently
+  // produce no tokens. The spine's own ROCm port moves this to gpu_available().
   switch (backend) {
     case quant::MatmulBackend::Cuda:
       if (quant::cuda_available())
@@ -575,6 +586,7 @@ uint64_t generate_prompt(const Gemma4Model& m, std::span<const uint64_t> prompt,
   // Phase 7 (M4): the prompt path is prefill (batched flash attention) + decode.
   // There is no f32 prefill variant, so CpuF32 degrades to the q8_K CPU prefill
   // (the reference oracle remains generate_reference for single-token decode).
+  // The device gate is CUDA-specific for the same reason as in generate().
   switch (backend) {
     case quant::MatmulBackend::Cuda:
       if (quant::cuda_available())

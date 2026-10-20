@@ -237,20 +237,29 @@ skips when no AMD device is present).
       Covered by `tests/core/test_gpu_gate.cpp` (gate semantics across builds +
       dispatched matvec/matmul vs the CPU f32 reference; it runs on the ROCm
       build here).
-- [ ] **The rest of the runtime is still `cuda_available()`-gated and therefore
-      stays off on AMD:** the `exec.cpp` elementwise / device-resident routing
-      (`core/src/model/exec.cpp:264`, `:434`, `:507`, `:561`, `:580` — the
-      kernels it calls exist as HIP twins, but each routing decision needs its
-      kernel's AMD coverage confirmed before flipping), the CUDA spine
-      (`core/src/model/gemma4_plan.cpp:1107`, whose `#else` stubs at `:2497` /
-      `:3260` make the whole `generate_spine_cuda*` path a no-op), planner
-      device enumeration (`core/src/planner/resource.cpp:270`) and the
-      spine-gated tests (`test_generate.cpp:269`, `test_planner_resource.cpp`,
-      `test_plan_cache.cpp`, `test_plan_record.cpp`, `test_prefix_cache.cpp`,
-      `test_boom_conversion.cpp`). The gate itself is no longer the blocker for
-      `test_generate.cpp:171` (Cuda matvec vs the CPU q8_K oracle), which is
-      backend-neutral and can move to `gpu_available()`; it still needs a GGUF
-      fixture to run.
+- [x] **Per-op routing and the device-resident forward on AMD.**
+      `core/src/model/exec.cpp` now builds its `*_d` dispatch layer under both
+      GPU backends (the HIP twin of `cuda_elementwise.cu` defines the same
+      `nn::cuda::*` symbols) and gates it on `quant::gpu_available()`, so a
+      `MatmulBackend::Cuda` forward runs rms_norm / rope / gelu / mul / add /
+      scale / dense matvec on the iGPU. The device-resident fast path
+      (`cuda_forward_resident`, `:438`) is the same file on both backends
+      (`model/cuda_block.cpp` allocates via `SB_DEV_MALLOC` and calls the same
+      twins), so it is enabled too. Not exercised end-to-end here (no GGUF
+      fixture); the kernels themselves are the ones `test_cuda_elementwise` /
+      `test_cuda_quant` already cover on this build.
+- [ ] **Spine + planner GPU enumeration (one unit).** `generate()` /
+      `generate_prompt()` keep the CUDA-specific query on purpose: on a ROCm
+      build `generate_spine_cuda` / `generate_prefill_spine_cuda`
+      (`core/src/model/gemma4_plan.cpp:1107`, `:2607`) are the `#else` stubs
+      returning 0, so routing a device into them would silently emit no tokens.
+      `planner/resource.cpp:270` stays CUDA-gated for the same reason: a GPU
+      device in the default snapshot makes plans place work on a backend
+      nothing registers on ROCm. Both flip when the CUDA spine is ported to HIP
+      (capture + NVTX + `SonicCudaBackend`), which is the remaining Phase 4
+      item. `test_generate.cpp:171` / `:269` also stay gated until then: they
+      go through `generate()`, so on ROCm they would exercise the CPU spine and
+      label it "Cuda" (`:171`) or hit the stub (`:269`).
 - [ ] Vendor-neutral IDs: `DeviceType::GPU`, `BackendId::gpu()`, `quant::gpu`;
       move `sonic_cuda_backend.h` behind boundary.
 - [ ] Relax byte-identity attention/GEMM asserts (wave/expf differences) —
