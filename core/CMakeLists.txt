@@ -91,6 +91,12 @@ list(REMOVE_ITEM SONICBOOM_MODEL_SOURCES
 file(GLOB_RECURSE SONICBOOM_THREADPOOL_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/thread_pool.cpp)
 
+# Training (core/src/training/): the AdamW host reference and the device/host
+# Param storage. Pure C++23 here; the fused device kernel (adamw.cu) is added
+# in the CUDA block below.
+file(GLOB_RECURSE SONICBOOM_TRAINING_SOURCES CONFIGURE_DEPENDS
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/training/*.cpp)
+
 # libsonicboom.so is SonicBoom's final published core library (SHARED).
 # Native-torch and MLIR are statically linked into it. The stable C ABI
 # (sonicboom_capi object library) is folded in so its `extern "C"` symbols are
@@ -106,6 +112,7 @@ add_library(sonicboom SHARED
   ${SONICBOOM_NN_SOURCES}
   ${SONICBOOM_MODEL_SOURCES}
   ${SONICBOOM_THREADPOOL_SOURCES}
+  ${SONICBOOM_TRAINING_SOURCES}
   ${CMAKE_CURRENT_SOURCE_DIR}/src/mlir/smoke.cpp
   $<TARGET_OBJECTS:sonicboom_capi>)
 
@@ -153,8 +160,32 @@ if(SONICBOOM_USE_CUDA)
   target_compile_definitions(sonicboom PRIVATE SONICBOOM_USE_CUDA=1)
   # cuda_driver: the glue JIT (src/planner/glue_jit.cpp) loads compiler-generated
   # PTX with cuModuleLoadData and launches it on the planner's stream.
+  # NVTX is header-only in nvtx3: the shim provides inline implementations, so
+  # there is no library to link. CUDA >= 12.9 no longer ships libnvtx with the
+  # toolkit; an old /usr/include/nvToolsExt.h can still be present and hide the
+  # missing symbol until link time, which is why the old nvToolsExt link target
+  # is gone.
   target_link_libraries(sonicboom PRIVATE CUDA::cudart CUDA::cublas
-                                       CUDA::cuda_driver nvToolsExt)
+                                       CUDA::cuda_driver)
+
+  # The nvtx3 shim lives in the toolkit's include directory. On CUDA 13.x
+  # CUDAToolkit_INCLUDE_DIRS is a LIST (e.g. ".../include;.../include/cccl"),
+  # so it is searched entry by entry: appending "/nvtx3" to the quoted list
+  # would produce one literal-';' path that never matches and leave the include
+  # to chance. EXISTS is used rather than find_path because a find in a CUDA
+  # language is re-rooted through CMAKE_FIND_ROOT_PATH (NO_DEFAULT_PATH does
+  # not bypass that), and because an absent entry is not an error here: a shim
+  # on the compiler's own default include path needs no extra flag.
+  set(_sb_nvtx3_include "")
+  foreach(_sb_cuda_include IN LISTS CUDAToolkit_INCLUDE_DIRS)
+    if(EXISTS "${_sb_cuda_include}/nvtx3/nvToolsExt.h")
+      set(_sb_nvtx3_include "${_sb_cuda_include}")
+      break()
+    endif()
+  endforeach()
+  if(_sb_nvtx3_include)
+    target_include_directories(sonicboom PRIVATE "${_sb_nvtx3_include}")
+  endif()
   # SonicBoom-owned CUDA K-quant matvec kernel (dequantize-on-the-fly gemv).
   # Compiled with nvcc (enable_language(CUDA) + CMAKE_CUDA_ARCHITECTURES=86 are
   # set in the root CMakeLists), statically linked into libsonicboom.so like the
@@ -162,6 +193,11 @@ if(SONICBOOM_USE_CUDA)
   target_sources(sonicboom PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/quant/cuda_quant_matmul.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/cuda_elementwise.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/training/adamw.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/training/backward_ops.cu
+    # The training graph executor's forward + AdamW kernels (device_graph.cpp
+    # dispatches them; the fused adjoints are backward_ops.cu above).
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/training/device_graph_kernels.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/src/model/cuda_block.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/planner/sonic_cuda_backend.cpp)
   # ggml-derived MMQ at upstream build parity (step 9): llama.cpp compiles

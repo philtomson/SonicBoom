@@ -16,6 +16,8 @@
   #:export (make-ctensor ctensor? ctensor-dtype ctensor-shape ctensor-data
             ctensor-numel ctensor-ref ctensor->list ctensor->nested
             list->ctensor scalar->ctensor ctensor-item
+            make-leaf leaf? leaf-value set-leaf-value! leaf-grad set-leaf-grad!
+            make-lr-tensor
             shape-numel float-dtype? int-dtype? valid-dtype?
             coerce-value))
 
@@ -97,3 +99,40 @@ otherwise."
   (unless (= (ctensor-numel t) 1)
     (error "ctensor-item: tensor has more than one element" (ctensor-shape t)))
   (ctensor-ref t 0))
+
+;;; --- leaf tensors (parameters) ------------------------------------------------------
+;;
+;;; A leaf is what training differentiates: a tensor value with a gradient slot.
+;;; It is deliberately not the value itself, so that the tracer can replace the
+;;; value by a symbolic input while the object the caller holds stays the same
+;;; identity across calls. During tracing a leaf contains a symbolic tensor and
+;;; its GRAD is the symbolic adjoint recorded by `backward!`; after a traced
+;;; call the tracer writes the concrete gradient of the executed graph back into
+;;; the caller's leaf (see (sonicboom trace tracer)). Ops accept a leaf anywhere
+;;; they accept a tensor and use its value.
+
+(define-record-type <leaf>
+  (%make-leaf value grad)
+  leaf?
+  (value leaf-value set-leaf-value!)
+  (grad  leaf-grad  set-leaf-grad!))
+
+(define* (make-leaf value #:optional (grad #f))
+  "A leaf tensor: VALUE (a ctensor, or the symbolic tensor the tracer substitutes
+for it) plus a GRAD slot."
+  (%make-leaf value grad))
+
+(define* (make-lr-tensor #:optional (device 'cpu) #:key (value 1e-3))
+  "A one-element float32 learning-rate tensor for a traced training step.
+
+Passed to `adamw-step!` as #:lr, it becomes a graph input instead of an
+attribute, so a schedule can change the rate every step without retracing.
+Returns a leaf: replace the rate between steps with set-leaf-value!.
+
+DEVICE names where the tensor lives ('cpu or 'cuda). The tracing executor
+transfers the tensor's current value on every run, so the tensor is held on
+the host today; the argument is accepted for call-site symmetry with device
+tensors and for a future device-resident path."
+  (unless (memq device '(cpu cuda))
+    (error "make-lr-tensor: unknown device" device))
+  (make-leaf (scalar->ctensor value 'float32)))

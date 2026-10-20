@@ -120,9 +120,38 @@
 (define (segment-defs nodes params)
   (append (append-map gnode-output-names nodes) (map gparam-name params)))
 
+(define (segment-leaf-outputs st nodes params outputs)
+  "OUTPUTS plus the value and .grad of every registered leaf that this segment
+defines. A traced call reads those back: the gradient is written into the
+caller's leaf, and a value the body replaced (an optimizer step's new
+parameter/moment) replaces the caller's leaf value (see sync-leaf-state!)."
+  (let* (;; Only values a node produces can be graph outputs: a leaf whose
+         ;; gradient is a constant (a leaf the loss does not use) needs no
+         ;; output, and marking the parameter as one would be rejected by the
+         ;; verifier (a graph output must be produced by a node).
+         (defs (append-map gnode-output-names nodes))
+         (leaves (filter-map
+                  (lambda (p)
+                    (let ((v (leaf-value (cdr p))) (g (leaf-grad (cdr p))))
+                      (append
+                       ;; A leaf whose value is still its own input symbol was
+                       ;; not updated by this segment.
+                       (if (and (sym? v) (not (equal? (sym-name v) (car p)))
+                                (member (sym-name v) defs))
+                           (list (sym-name v)) '())
+                       (if (and (sym? g) (member (sym-name g) defs))
+                           (list (sym-name g)) '()))))
+                  (trace-context-leaves (tstate-ctx st)))))
+    (delete-duplicates (append outputs (apply append leaves)))))
+
 (define (compile-segment st label nodes params outputs)
   "DCE NODES/PARAMS from OUTPUTS and emit the S-Expr v0.1 text. Inputs are the
-values referenced but not defined by what survives."
+values referenced but not defined by what survives. Leaf state this segment
+defines is always an output, so a traced call observes it."
+  (let ((outputs (segment-leaf-outputs st nodes params outputs)))
+    (compile-segment-1 st label nodes params outputs)))
+
+(define (compile-segment-1 st label nodes params outputs)
   (call-with-values (lambda () (eliminate-dead-nodes nodes params outputs))
     (lambda (nodes* params*)
       (let* ((defs (segment-defs nodes* params*))
@@ -357,34 +386,61 @@ earlier segments or the call's arguments."
 ;;; as structures. Everything else in an argument is static: part of the
 ;;; cache key and passed to the procedure as is.
 
-(define (arg-tensors args)
-  "Alist (input-name . ctensor) of every tensor in ARGS."
+(define (tensor-arg? x) (or (ctensor? x) (leaf? x)))
+
+(define (arg-items pred args)
+  "Alist (input-name . item) of every element of ARGS satisfying PRED, named
+\"arg<i>\" at the top level and \"arg<i>.<k>\" inside list/vector arguments.
+Tensors and leaves share one numbering, so a leaf's name matches the graph
+input its value becomes."
   (append-map
    (lambda (a i)
      (let ((base (string-append "arg" (number->string i))))
-       (if (ctensor? a)
-           (list (cons base a))
+       (if (tensor-arg? a)
+           (if (pred a) (list (cons base a)) '())
            (let ((k 0) (acc '()))
              (let walk ((x a))
-               (cond ((ctensor? x)
-                      (set! acc (cons (cons (string-append base "." (number->string k)) x)
-                                      acc))
+               (cond ((tensor-arg? x)
+                      (when (pred x)
+                        (set! acc (cons (cons (string-append base "." (number->string k)) x)
+                                        acc)))
                       (set! k (+ k 1)))
                      ((pair? x) (walk (car x)) (walk (cdr x)))
                      ((vector? x) (for-each walk (vector->list x)))))
              (reverse acc)))))
    args (iota (length args))))
 
-(define (map-tensors f args)
-  "ARGS with each tensor replaced by (F name tensor), names as in arg-tensors."
+(define (arg-tensors args)
+  "Alist (input-name . ctensor) of every tensor value in ARGS. A leaf
+contributes its value: that is the graph input the trace substitutes."
+  (map (lambda (p) (cons (car p) (unwrap-leaf (cdr p))))
+       (arg-items tensor-arg? args)))
+
+(define (arg-leaves args)
+  "Alist (input-name . leaf) of every leaf tensor in ARGS, names as in
+arg-tensors."
+  (arg-items leaf? args))
+
+(define* (map-tensors f args #:optional (keep-leaves? #f) (ctx #f))
+  "ARGS with each tensor (or leaf value) replaced by (F name tensor), names as
+in arg-tensors. With KEEP-LEAVES? a leaf argument stays a leaf wrapping the
+result (the trace-time leaf), and is registered in CTX so backward! can store
+gradients on it."
+  (define (bind name x)
+    (let ((r (f name (unwrap-leaf x))))
+      (if (and keep-leaves? (leaf? x))
+          (let ((l (make-leaf r)))
+            (when ctx (register-leaf! ctx name l))
+            l)
+          r)))
   (map (lambda (a i)
          (let ((base (string-append "arg" (number->string i))))
-           (if (ctensor? a)
-               (f base a)
+           (if (tensor-arg? a)
+               (bind base a)
                (let ((k 0))
                  (let walk ((x a))
-                   (cond ((ctensor? x)
-                          (let ((r (f (string-append base "." (number->string k)) x)))
+                   (cond ((tensor-arg? x)
+                          (let ((r (bind (string-append base "." (number->string k)) x)))
                             (set! k (+ k 1))
                             r))
                          ((pair? x) (let* ((h (walk (car x))) (t (walk (cdr x)))) (cons h t)))
@@ -543,11 +599,14 @@ extended?)."
                (else (restart #t)))))))))
 
 (define (fresh-trace st args)
-  (let ((sym-args (map-tensors (lambda (name t)
-                                 (make-sym name (ctensor-dtype t) (ctensor-shape t)))
-                               args)))
-    (trace-segment st (segment-recorder st '())
-                   (lambda () (list 'done (apply (tstate-proc st) sym-args))))))
+  (let ((ctx (tstate-ctx st)))
+    ;; Leaves of a previous trace carry gradient names of that trace.
+    (set-trace-context-leaves! ctx '())
+    (let ((sym-args (map-tensors (lambda (name t)
+                                   (make-sym name (ctensor-dtype t) (ctensor-shape t)))
+                                 args #t ctx)))
+      (trace-segment st (segment-recorder st '())
+                     (lambda () (list 'done (apply (tstate-proc st) sym-args)))))))
 
 ;;; Guards: the current values of the procedure's free variables are part of
 ;;; the cache key. Values are snapshotted (pairs and vectors copied) when a
@@ -603,7 +662,31 @@ extended?)."
       (call-with-values (lambda () (replay st entry args))
         (lambda (result extended?)
           (unless (or fresh? extended?) (stat! st 'cache-hits))
+          (sync-leaf-state! st args)
           result)))))
+
+(define (sync-leaf-state! st args)
+  "Copy each caller leaf's concrete state out of the environment the executed
+graph left behind. The trace-time leaf holds the symbolic adjoint backward!
+recorded and, when the body updated it (an optimizer step), the symbolic new
+value; compile-segment made both graph outputs, so replay bound them here. A
+gradient is written to the caller's .grad; an updated value replaces the
+caller's .value, unless the trace-time value is still the leaf's own input."
+  (let ((ctx (tstate-ctx st))
+        (env (tstate-env st)))
+    (for-each
+     (lambda (p)
+       (let ((trace-leaf (assoc-ref (trace-context-leaves ctx) (car p))))
+         (when trace-leaf
+           (let ((v (leaf-value trace-leaf))
+                 (g (leaf-grad trace-leaf)))
+             (when (and (sym? v) (not (equal? (sym-name v) (car p))))
+               (let ((new (table-ref env (sym-name v) #f)))
+                 (when new (set-leaf-value! (cdr p) new))))
+             (when (sym? g)
+               (let ((new (table-ref env (sym-name g) #f)))
+                 (when new (set-leaf-grad! (cdr p) new))))))))
+     (arg-leaves args))))
 
 ;;; --- public API ------------------------------------------------------------------------------
 

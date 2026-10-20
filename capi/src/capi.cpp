@@ -37,17 +37,24 @@
 #include <sonicboom/sx/ir.h>
 #include <sonicboom/sx/parser.h>
 #include <sonicboom/tensor.h>
+#include <sonicboom/training/clip_grad_norm.h>
+#include <sonicboom/training/device_graph.h>
+#include <sonicboom/training/param.h>
 #include <sonicboom/vocab/vocab.h>
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <new>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -60,11 +67,30 @@ struct sb_document {
 };
 
 struct sb_executable {
+  // Exactly one of the two is set: the CPU interpreter's executable
+  // (sb_compile) or a compiled device training graph (sb_compile_device). The
+  // introspection, bind, execute and retrieve entry points below are shared,
+  // and so are the sb_run_multi semantics.
   std::unique_ptr<sx::Executable> exe;
+  std::unique_ptr<sonicboom::training::DeviceTrainingGraph> device;
   bool input_bound = false;
   sx::Bytes input;    // copied at bind time
   sx::Bytes output;   // retained after execute
   bool has_output = false;
+
+  bool is_device() const { return device != nullptr; }
+  std::size_t input_count() const;
+  std::size_t output_count() const;
+  void input_info(std::size_t index, sb_dtype *dtype_out, int64_t *rank_out,
+                  const int64_t **dims_out, uint64_t *num_bytes_out) const;
+  void output_info(std::size_t index, sb_dtype *dtype_out, int64_t *rank_out,
+                   const int64_t **dims_out, uint64_t *num_bytes_out) const;
+  uint64_t input_num_bytes(std::size_t index) const;
+  uint64_t output_num_bytes(std::size_t index) const;
+  // Tensor names in binding order; nullptr for the CPU interpreter, whose
+  // executable does not retain value names.
+  const char *input_name(std::size_t index) const;
+  const char *output_name(std::size_t index) const;
 };
 
 struct sb_error {
@@ -78,6 +104,10 @@ struct sb_tensor {
 
 struct sb_tape {
   sonicboom::Tape tape;
+};
+
+struct sb_param {
+  std::unique_ptr<sonicboom::training::Param> p;
 };
 
 namespace model = sonicboom::model;
@@ -432,6 +462,28 @@ sb_status sb_compile(const sb_document *doc, const char *base_dir,
       err_out);
 }
 
+sb_status sb_compile_device(const sb_document *doc, sb_executable **exe_out,
+                            sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!doc || !exe_out)
+          return fail_arg(err_out);
+        *exe_out = nullptr;
+
+        auto graph = sonicboom::training::DeviceTrainingGraph::compile(doc->doc);
+        if (!graph) {
+          set_error(err_out, SB_ERRKIND_COMPILE, graph.error().c_str());
+          return SB_ERR_COMPILE;
+        }
+
+        auto *out = new sb_executable();
+        out->device = std::move(*graph);
+        *exe_out = out;
+        return SB_OK;
+      },
+      err_out);
+}
+
 // --- I/O introspection (bind) -----------------------------------------------
 
 namespace {
@@ -449,17 +501,79 @@ void fill_tensor_info(const sx::TensorType &t, sb_dtype *dtype_out,
     *num_bytes_out = tensor_num_bytes(t);
 }
 
+using DeviceInfo = sonicboom::training::DeviceTensorInfo;
+
+void fill_device_info(const DeviceInfo &t, sb_dtype *dtype_out,
+                      int64_t *rank_out, const int64_t **dims_out,
+                      uint64_t *num_bytes_out) {
+  if (dtype_out)
+    *dtype_out = map_dtype(t.dtype);
+  if (rank_out)
+    *rank_out = static_cast<int64_t>(t.shape.size());
+  if (dims_out)
+    *dims_out = t.shape.data();
+  if (num_bytes_out)
+    *num_bytes_out = t.num_bytes;
+}
+
 } // namespace
+
+std::size_t sb_executable::input_count() const {
+  return is_device() ? device->inputs().size() : exe->input_types().size();
+}
+
+std::size_t sb_executable::output_count() const {
+  return is_device() ? device->outputs().size() : exe->output_types().size();
+}
+
+void sb_executable::input_info(std::size_t index, sb_dtype *dtype_out,
+                               int64_t *rank_out, const int64_t **dims_out,
+                               uint64_t *num_bytes_out) const {
+  if (is_device())
+    fill_device_info(device->inputs()[index], dtype_out, rank_out, dims_out,
+                     num_bytes_out);
+  else
+    fill_tensor_info(exe->input_types()[index], dtype_out, rank_out, dims_out,
+                     num_bytes_out);
+}
+
+void sb_executable::output_info(std::size_t index, sb_dtype *dtype_out,
+                                int64_t *rank_out, const int64_t **dims_out,
+                                uint64_t *num_bytes_out) const {
+  if (is_device())
+    fill_device_info(device->outputs()[index], dtype_out, rank_out, dims_out,
+                     num_bytes_out);
+  else
+    fill_tensor_info(exe->output_types()[index], dtype_out, rank_out, dims_out,
+                     num_bytes_out);
+}
+
+uint64_t sb_executable::input_num_bytes(std::size_t index) const {
+  return is_device() ? device->inputs()[index].num_bytes
+                     : tensor_num_bytes(exe->input_types()[index]);
+}
+
+uint64_t sb_executable::output_num_bytes(std::size_t index) const {
+  return is_device() ? device->outputs()[index].num_bytes
+                     : tensor_num_bytes(exe->output_types()[index]);
+}
+
+const char *sb_executable::input_name(std::size_t index) const {
+  return is_device() ? device->inputs()[index].name.c_str() : nullptr;
+}
+
+const char *sb_executable::output_name(std::size_t index) const {
+  return is_device() ? device->outputs()[index].name.c_str() : nullptr;
+}
 
 sb_status sb_input_info(const sb_executable *exe, sb_dtype *dtype_out,
                         int64_t *rank_out, const int64_t **dims_out,
                         uint64_t *num_bytes_out) {
   return guard(
       [&]() -> sb_status {
-        if (!exe)
+        if (!exe || exe->input_count() == 0)
           return fail_arg(nullptr);
-        fill_tensor_info(exe->exe->input_type(), dtype_out, rank_out, dims_out,
-                         num_bytes_out);
+        exe->input_info(0, dtype_out, rank_out, dims_out, num_bytes_out);
         return SB_OK;
       },
       nullptr);
@@ -470,10 +584,82 @@ sb_status sb_output_info(const sb_executable *exe, sb_dtype *dtype_out,
                          uint64_t *num_bytes_out) {
   return guard(
       [&]() -> sb_status {
-        if (!exe)
+        if (!exe || exe->output_count() == 0)
           return fail_arg(nullptr);
-        fill_tensor_info(exe->exe->output_type(), dtype_out, rank_out, dims_out,
-                         num_bytes_out);
+        exe->output_info(0, dtype_out, rank_out, dims_out, num_bytes_out);
+        return SB_OK;
+      },
+      nullptr);
+}
+
+sb_status sb_input_count(const sb_executable *exe, size_t *count_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!exe || !count_out)
+          return fail_arg(nullptr);
+        *count_out = exe->input_count();
+        return SB_OK;
+      },
+      nullptr);
+}
+
+sb_status sb_output_count(const sb_executable *exe, size_t *count_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!exe || !count_out)
+          return fail_arg(nullptr);
+        *count_out = exe->output_count();
+        return SB_OK;
+      },
+      nullptr);
+}
+
+sb_status sb_input_info_at(const sb_executable *exe, size_t index,
+                           sb_dtype *dtype_out, int64_t *rank_out,
+                           const int64_t **dims_out, uint64_t *num_bytes_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!exe || index >= exe->input_count())
+          return fail_arg(nullptr);
+        exe->input_info(index, dtype_out, rank_out, dims_out, num_bytes_out);
+        return SB_OK;
+      },
+      nullptr);
+}
+
+sb_status sb_output_info_at(const sb_executable *exe, size_t index,
+                            sb_dtype *dtype_out, int64_t *rank_out,
+                            const int64_t **dims_out,
+                            uint64_t *num_bytes_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!exe || index >= exe->output_count())
+          return fail_arg(nullptr);
+        exe->output_info(index, dtype_out, rank_out, dims_out, num_bytes_out);
+        return SB_OK;
+      },
+      nullptr);
+}
+
+sb_status sb_input_name_at(const sb_executable *exe, size_t index,
+                           const char **name_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!exe || !name_out || index >= exe->input_count())
+          return fail_arg(nullptr);
+        *name_out = exe->input_name(index);
+        return SB_OK;
+      },
+      nullptr);
+}
+
+sb_status sb_output_name_at(const sb_executable *exe, size_t index,
+                            const char **name_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!exe || !name_out || index >= exe->output_count())
+          return fail_arg(nullptr);
+        *name_out = exe->output_name(index);
         return SB_OK;
       },
       nullptr);
@@ -485,10 +671,10 @@ sb_status sb_bind_input(sb_executable *exe, const void *data, size_t len,
                         sb_error **err_out) {
   return guard(
       [&]() -> sb_status {
-        if (!exe || !data)
+        if (!exe || !data || exe->input_count() == 0)
           return fail_arg(err_out);
 
-        uint64_t expected = tensor_num_bytes(exe->exe->input_type());
+        uint64_t expected = exe->input_num_bytes(0);
         if (static_cast<uint64_t>(len) != expected) {
           std::string msg = "input buffer is " + std::to_string(len) +
                             " bytes, expected " + std::to_string(expected);
@@ -504,6 +690,101 @@ sb_status sb_bind_input(sb_executable *exe, const void *data, size_t len,
       err_out);
 }
 
+sb_status sb_run_multi(sb_executable *exe, const void *const *input_data,
+                       const size_t *input_lens, size_t num_inputs,
+                       void *const *output_data, const size_t *output_caps,
+                       size_t num_outputs, size_t *output_lens,
+                       sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!exe || !input_data || !input_lens || !output_data ||
+            !output_caps)
+          return fail_arg(err_out);
+
+        const std::size_t in_count = exe->input_count();
+        const std::size_t out_count = exe->output_count();
+        if (num_inputs != in_count) {
+          std::string msg =
+              "graph takes " + std::to_string(in_count) +
+              " inputs, sb_run_multi got " + std::to_string(num_inputs);
+          set_error(err_out, SB_ERRKIND_BINDING, msg.c_str());
+          return SB_ERR_BINDING;
+        }
+        if (num_outputs != out_count) {
+          std::string msg =
+              "graph has " + std::to_string(out_count) +
+              " outputs, sb_run_multi got " + std::to_string(num_outputs);
+          set_error(err_out, SB_ERRKIND_BINDING, msg.c_str());
+          return SB_ERR_BINDING;
+        }
+
+        // Validate every buffer before running: a binding error must leave
+        // the output buffers untouched.
+        std::vector<sx::Bytes> ins;
+        ins.reserve(num_inputs);
+        for (size_t i = 0; i < num_inputs; ++i) {
+          uint64_t need = exe->input_num_bytes(i);
+          if (input_lens[i] != need) {
+            std::string msg = "input " + std::to_string(i) + " is " +
+                              std::to_string(input_lens[i]) +
+                              " bytes, expected " + std::to_string(need);
+            set_error(err_out, SB_ERRKIND_BINDING, msg.c_str());
+            return SB_ERR_BINDING;
+          }
+          if (need == 0) {
+            ins.emplace_back();
+            continue;
+          }
+          if (!input_data[i])
+            return fail_arg(err_out);
+          const auto *p = static_cast<const std::byte *>(input_data[i]);
+          ins.emplace_back(p, p + need);
+        }
+        for (size_t i = 0; i < num_outputs; ++i) {
+          uint64_t need = exe->output_num_bytes(i);
+          if (!output_data[i] || output_caps[i] < need) {
+            std::string msg = "output " + std::to_string(i) + " has capacity " +
+                              std::to_string(output_caps[i]) +
+                              " bytes, expected " + std::to_string(need);
+            set_error(err_out, SB_ERRKIND_BINDING, msg.c_str());
+            return SB_ERR_BINDING;
+          }
+        }
+
+        std::vector<sx::Bytes> outs;
+        if (exe->is_device()) {
+          std::vector<const std::byte *> ptrs(num_inputs);
+          for (size_t i = 0; i < num_inputs; ++i)
+            ptrs[i] = static_cast<const std::byte *>(input_data[i]);
+          std::vector<std::vector<std::byte>> device_outs;
+          std::string device_error;
+          if (!exe->device->run(ptrs.data(), input_lens, &device_outs,
+                                &device_error)) {
+            set_error(err_out, SB_ERRKIND_RUNTIME, device_error.c_str());
+            return SB_ERR_RUNTIME;
+          }
+          outs.resize(device_outs.size());
+          for (size_t i = 0; i < device_outs.size(); ++i)
+            outs[i] = std::move(device_outs[i]);
+        } else {
+          auto res = exe->exe->run(ins, outs);
+          if (!res) {
+            set_error(err_out, exec_errkind(res.error().kind),
+                      res.error().message.c_str());
+            return exec_status(res.error().kind);
+          }
+        }
+
+        for (size_t i = 0; i < num_outputs; ++i) {
+          std::memcpy(output_data[i], outs[i].data(), outs[i].size());
+          if (output_lens)
+            output_lens[i] = outs[i].size();
+        }
+        return SB_OK;
+      },
+      err_out);
+}
+
 sb_status sb_execute(sb_executable *exe, sb_error **err_out) {
   return guard(
       [&]() -> sb_status {
@@ -514,16 +795,26 @@ sb_status sb_execute(sb_executable *exe, sb_error **err_out) {
                     "input not bound (call sb_bind_input)");
           return SB_ERR_BINDING;
         }
-
-        auto res = exe->exe->run(exe->input, exe->output);
-        if (!res) {
+        size_t n_out = exe->output_count();
+        if (n_out != 1) {
+          std::string msg =
+              "graph has " + std::to_string(n_out) +
+              " outputs; sb_execute is the 1-in/1-out wrapper, use sb_run_multi";
+          set_error(err_out, SB_ERRKIND_BINDING, msg.c_str());
           exe->has_output = false;
-          set_error(err_out, exec_errkind(res.error().kind),
-                    res.error().message.c_str());
-          return exec_status(res.error().kind);
+          return SB_ERR_BINDING;
         }
-        exe->has_output = true;
-        return SB_OK;
+
+        exe->output.resize(exe->output_num_bytes(0));
+        const void *in_ptr = exe->input.data();
+        size_t in_len = exe->input.size();
+        void *out_ptr = exe->output.data();
+        size_t out_cap = exe->output.size();
+        size_t written = 0;
+        sb_status s = sb_run_multi(exe, &in_ptr, &in_len, 1, &out_ptr,
+                                   &out_cap, 1, &written, err_out);
+        exe->has_output = (s == SB_OK);
+        return s;
       },
       err_out);
 }
@@ -637,6 +928,189 @@ sb_status sb_tensor_bytes(const sb_tensor *t, void *out, size_t cap,
 
 void sb_tensor_free(sb_tensor *t) { delete t; }
 
+// --- Training: parameter + fused AdamW --------------------------------------
+
+namespace {
+
+// Element count of a row-major shape, rejecting a negative dimension, a zero
+// extent (a parameter with no elements has no update) and uint64 overflow.
+bool param_numel(const int64_t *dims, int64_t rank, uint64_t &numel) {
+  if (!dims || rank <= 0)
+    return false;
+  numel = 1;
+  for (int64_t i = 0; i < rank; ++i) {
+    if (dims[i] <= 0)
+      return false;
+    if (numel > UINT64_MAX / static_cast<uint64_t>(dims[i]))
+      return false;
+    numel *= static_cast<uint64_t>(dims[i]);
+  }
+  return true;
+}
+
+} // namespace
+
+sb_status sb_param_create(const int64_t *dims, int64_t rank, const void *init,
+                          size_t len, sb_param **out, sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!out || !init)
+          return fail_arg(err_out);
+        *out = nullptr;
+
+        uint64_t numel = 0;
+        if (!param_numel(dims, rank, numel))
+          return fail_arg(err_out);
+        if (numel > UINT64_MAX / sizeof(float) ||
+            len != static_cast<size_t>(numel * sizeof(float))) {
+          set_error(err_out, SB_ERRKIND_BINDING,
+                    "parameter byte count does not match shape");
+          return SB_ERR_BINDING;
+        }
+
+        std::vector<float> values(static_cast<size_t>(numel));
+        std::memcpy(values.data(), init, len);
+        auto p = sonicboom::training::Param::create(values);
+        if (!p) {
+          set_error(err_out, SB_ERRKIND_INTERNAL, p.error().c_str());
+          return SB_ERR_INTERNAL;
+        }
+        *out = new sb_param{std::move(*p)};
+        return SB_OK;
+      },
+      err_out);
+}
+
+sb_status sb_param_numel(const sb_param *p, size_t *numel_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!p || !numel_out)
+          return fail_arg(nullptr);
+        *numel_out = p->p->size();
+        return SB_OK;
+      },
+      nullptr);
+}
+
+int sb_param_on_device(const sb_param *p) {
+  return p && p->p->on_device() ? 1 : 0;
+}
+
+uint64_t sb_param_step_count(const sb_param *p) {
+  return p ? p->p->step_count() : 0;
+}
+
+sb_status sb_param_zero_grad(sb_param *p, sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!p)
+          return fail_arg(err_out);
+        p->p->zero_grad();
+        return SB_OK;
+      },
+      err_out);
+}
+
+sb_status sb_param_set_grad(sb_param *p, const void *grad, size_t len,
+                            sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!p || !grad)
+          return fail_arg(err_out);
+        const size_t want = p->p->size() * sizeof(float);
+        if (len != want) {
+          std::string msg = "gradient buffer is " + std::to_string(len) +
+                            " bytes, expected " + std::to_string(want);
+          set_error(err_out, SB_ERRKIND_BINDING, msg.c_str());
+          return SB_ERR_BINDING;
+        }
+        std::vector<float> values(p->p->size());
+        std::memcpy(values.data(), grad, len);
+        if (!p->p->set_grad(values)) {
+          set_error(err_out, SB_ERRKIND_RUNTIME, "gradient upload failed");
+          return SB_ERR_RUNTIME;
+        }
+        return SB_OK;
+      },
+      err_out);
+}
+
+sb_status sb_param_step(sb_param *p, float lr, float beta1, float beta2,
+                        float eps, float weight_decay, sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!p)
+          return fail_arg(err_out);
+        sonicboom::training::AdamWConfig cfg;
+        cfg.lr = lr;
+        cfg.beta1 = beta1;
+        cfg.beta2 = beta2;
+        cfg.eps = eps;
+        cfg.weight_decay = weight_decay;
+        if (!p->p->step(cfg)) {
+          set_error(err_out, SB_ERRKIND_RUNTIME, "AdamW update failed");
+          return SB_ERR_RUNTIME;
+        }
+        return SB_OK;
+      },
+      err_out);
+}
+
+sb_status sb_param_step_lr(sb_param *p, const sb_tensor *lr, float beta1,
+                           float beta2, float eps, float weight_decay,
+                           sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!p || !lr)
+          return fail_arg(err_out);
+        if (lr->t.numel() != 1 || lr->t.dtype() != nt::ScalarType::Float) {
+          set_error(err_out, SB_ERRKIND_BINDING,
+                    "the learning rate must be a one-element float32 tensor");
+          return SB_ERR_BINDING;
+        }
+        sonicboom::training::AdamWConfig cfg;
+        cfg.lr = *static_cast<const float*>(lr->t.data_ptr());
+        cfg.beta1 = beta1;
+        cfg.beta2 = beta2;
+        cfg.eps = eps;
+        cfg.weight_decay = weight_decay;
+        if (!p->p->step(cfg)) {
+          set_error(err_out, SB_ERRKIND_RUNTIME, "AdamW update failed");
+          return SB_ERR_RUNTIME;
+        }
+        return SB_OK;
+      },
+      err_out);
+}
+
+sb_status sb_param_read(const sb_param *p, void *out, size_t cap,
+                        size_t *written_out, sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!p || !out)
+          return fail_arg(err_out);
+        const size_t n = p->p->size() * sizeof(float);
+        if (cap < n) {
+          std::string msg = "output buffer is " + std::to_string(cap) +
+                            " bytes, expected " + std::to_string(n);
+          set_error(err_out, SB_ERRKIND_BINDING, msg.c_str());
+          return SB_ERR_BINDING;
+        }
+        std::vector<float> values(p->p->size());
+        if (!p->p->read_param(values)) {
+          set_error(err_out, SB_ERRKIND_RUNTIME, "parameter read failed");
+          return SB_ERR_RUNTIME;
+        }
+        std::memcpy(out, values.data(), n);
+        if (written_out)
+          *written_out = n;
+        return SB_OK;
+      },
+      err_out);
+}
+
+void sb_param_free(sb_param *p) { delete p; }
+
 sb_status sb_tape_new(sb_tape **out, sb_error **err_out) {
   return guard(
       [&]() -> sb_status {
@@ -747,6 +1221,51 @@ sb_status sb_grad(const sb_tape *tape, const sb_tensor *param, sb_tensor **out,
       err_out);
 }
 
+sb_status sb_clip_grad_norm(sb_tensor *const *grads, int count, float max_norm,
+                            float *norm_out, sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (count < 0 || (count > 0 && !grads)) return fail_arg(err_out);
+        if (!std::isfinite(max_norm) || max_norm < 0.0f)
+          return fail_arg(err_out);
+        if (norm_out) *norm_out = 0.0f;
+        // The host reference reads and writes each gradient's storage in
+        // place, which is exactly the tape's gradient buffer: the next
+        // optimizer step sees the clipped values.
+        std::vector<float *> ptrs;
+        std::vector<std::size_t> sizes;
+        ptrs.reserve(static_cast<std::size_t>(count));
+        sizes.reserve(static_cast<std::size_t>(count));
+        for (int i = 0; i < count; ++i) {
+          const sb_tensor *t = grads[i];
+          if (!t || !t->t.defined()) return fail_arg(err_out);
+          if (t->t.dtype() != nt::ScalarType::Float) {
+            const std::string msg =
+                "gradient " + std::to_string(i) + " is not float32";
+            set_error(err_out, SB_ERRKIND_INTERNAL, msg.c_str());
+            return SB_ERR_INTERNAL;
+          }
+          if (t->t.device().type != nt::DeviceType::CPU) {
+            const std::string msg =
+                "gradient " + std::to_string(i) +
+                " is not on the CPU; use the device training graph "
+                "for GPU gradients";
+            set_error(err_out, SB_ERRKIND_INTERNAL, msg.c_str());
+            return SB_ERR_INTERNAL;
+          }
+          ptrs.push_back(static_cast<float *>(t->t.data_ptr()));
+          sizes.push_back(static_cast<std::size_t>(t->t.numel()));
+        }
+        const double norm = sonicboom::training::clip_grad_norm_inplace(
+            std::span<float *const>(ptrs.data(), ptrs.size()),
+            std::span<const std::size_t>(sizes.data(), sizes.size()),
+            static_cast<double>(max_norm));
+        if (norm_out) *norm_out = static_cast<float>(norm);
+        return SB_OK;
+      },
+      err_out);
+}
+
 // --- Export -----------------------------------------------------------------
 
 sb_status sb_export_model(const char *sx_text, size_t sx_len,
@@ -787,6 +1306,341 @@ sb_status sb_export_model(const char *sx_text, size_t sx_len,
           set_error(err_out, SB_ERRKIND_INTERNAL,
                     ("export: " + r.error().message).c_str());
           return SB_ERR_INTERNAL;
+        }
+        return SB_OK;
+      },
+      err_out);
+}
+
+// --- Checkpoints -------------------------------------------------------------
+
+namespace {
+
+// The canonical checkpoint magic. Bump the version character, never reuse it,
+// when the entry layout changes.
+constexpr char kCheckpointMagic[8] = {'S', 'B', 'C', 'K', 'P', 'T', '1', '\n'};
+constexpr uint32_t kCheckpointMaxRank = 16;
+constexpr uint32_t kCheckpointMaxName = 4096;
+
+void write_le(std::ofstream &out, uint64_t v, int bytes) {
+  char buf[8];
+  for (int i = 0; i < bytes; ++i)
+    buf[i] = static_cast<char>((v >> (8 * i)) & 0xff);
+  out.write(buf, bytes);
+}
+
+// Bounds-checked little-endian cursor over the whole checkpoint buffer.
+class CheckpointReader {
+ public:
+  CheckpointReader(const std::uint8_t *data, std::size_t size)
+      : data_(data), size_(size) {}
+
+  bool take(void *dst, std::size_t n) {
+    if (n > size_ - pos_)
+      return false;
+    if (n > 0)
+      std::memcpy(dst, data_ + pos_, n);
+    pos_ += n;
+    return true;
+  }
+
+  bool u8(std::uint8_t &v) { return take(&v, 1); }
+
+  bool u32(std::uint32_t &v) {
+    std::uint8_t b[4];
+    if (!take(b, 4))
+      return false;
+    v = static_cast<std::uint32_t>(b[0]) |
+        (static_cast<std::uint32_t>(b[1]) << 8) |
+        (static_cast<std::uint32_t>(b[2]) << 16) |
+        (static_cast<std::uint32_t>(b[3]) << 24);
+    return true;
+  }
+
+  bool u64(std::uint64_t &v) {
+    std::uint8_t b[8];
+    if (!take(b, 8))
+      return false;
+    v = 0;
+    for (int i = 7; i >= 0; --i)
+      v = (v << 8) | b[i];
+    return true;
+  }
+
+  bool i64(std::int64_t &v) {
+    std::uint64_t u = 0;
+    if (!u64(u))
+      return false;
+    v = static_cast<std::int64_t>(u);
+    return true;
+  }
+
+  bool skip(std::size_t n) {
+    if (n > size_ - pos_)
+      return false;
+    pos_ += n;
+    return true;
+  }
+
+  std::size_t remaining() const { return size_ - pos_; }
+  const std::uint8_t *here() const { return data_ + pos_; }
+
+ private:
+  const std::uint8_t *data_;
+  std::size_t size_;
+  std::size_t pos_ = 0;
+};
+
+// Row-major element count; rejects a negative dimension and uint64 overflow.
+bool checkpoint_numel(const std::vector<int64_t> &dims, uint64_t &numel) {
+  numel = 1;
+  for (int64_t d : dims) {
+    if (d < 0)
+      return false;
+    const uint64_t du = static_cast<uint64_t>(d);
+    if (du != 0 && numel > UINT64_MAX / du)
+      return false;
+    numel *= du;
+  }
+  return true;
+}
+
+bool read_whole_file(const char *path, std::vector<std::uint8_t> &bytes,
+                     std::string &why) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    why = "cannot open checkpoint file";
+    return false;
+  }
+  in.seekg(0, std::ios::end);
+  std::streamoff size = in.tellg();
+  if (size < 0) {
+    why = "cannot size checkpoint file";
+    return false;
+  }
+  in.seekg(0, std::ios::beg);
+  bytes.resize(static_cast<std::size_t>(size));
+  if (!bytes.empty())
+    in.read(reinterpret_cast<char *>(bytes.data()), size);
+  if (!in) {
+    why = "cannot read checkpoint file";
+    return false;
+  }
+  return true;
+}
+
+} // namespace
+
+sb_status sb_save_params(const char *path, const char *const *names,
+                         const sb_tensor *const *params, size_t count,
+                         sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!path)
+          return fail_arg(err_out);
+        if (count > 0 && (!names || !params))
+          return fail_arg(err_out);
+
+        // Validate everything before touching the file: a rejected save must
+        // not truncate an existing checkpoint.
+        std::unordered_set<std::string> seen;
+        seen.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+          if (!names[i] || !params[i])
+            return fail_arg(err_out);
+          std::string name(names[i]);
+          if (name.empty() || name.size() > kCheckpointMaxName) {
+            set_error(err_out, SB_ERRKIND_BINDING,
+                      "checkpoint entry name is empty or too long");
+            return SB_ERR_BINDING;
+          }
+          if (!seen.insert(name).second) {
+            const std::string msg = "duplicate checkpoint entry '" + name + "'";
+            set_error(err_out, SB_ERRKIND_BINDING, msg.c_str());
+            return SB_ERR_BINDING;
+          }
+          const nt::Tensor &t = params[i]->t;
+          if (t.dtype() != nt::ScalarType::Float) {
+            set_error(err_out, SB_ERRKIND_BINDING,
+                      "checkpoints only store float32 tensors");
+            return SB_ERR_BINDING;
+          }
+          if (t.dim() < 0 ||
+              static_cast<uint64_t>(t.dim()) > kCheckpointMaxRank) {
+            set_error(err_out, SB_ERRKIND_BINDING,
+                      "checkpoint tensor rank is out of range");
+            return SB_ERR_BINDING;
+          }
+        }
+
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) {
+          set_error(err_out, SB_ERRKIND_WEIGHT, "cannot create checkpoint file");
+          return SB_ERR_WEIGHT;
+        }
+        out.write(kCheckpointMagic, sizeof(kCheckpointMagic));
+        write_le(out, static_cast<uint64_t>(count), 8);
+        for (size_t i = 0; i < count; ++i) {
+          const std::string name(names[i]);
+          const nt::Tensor &t = params[i]->t;
+          write_le(out, static_cast<uint64_t>(name.size()), 4);
+          out.write(name.data(), static_cast<std::streamsize>(name.size()));
+          write_le(out, static_cast<uint64_t>(SB_DTYPE_FLOAT32), 1);
+          write_le(out, static_cast<uint64_t>(t.dim()), 4);
+          for (int64_t d = 0; d < t.dim(); ++d)
+            write_le(out, static_cast<uint64_t>(t.size(d)), 8);
+          const size_t n = f32_bytes(t.numel());
+          write_le(out, static_cast<uint64_t>(n), 8);
+          if (n > 0)
+            out.write(static_cast<const char *>(t.data_ptr()),
+                      static_cast<std::streamsize>(n));
+        }
+        out.flush();
+        if (!out) {
+          set_error(err_out, SB_ERRKIND_WEIGHT, "cannot write checkpoint file");
+          return SB_ERR_WEIGHT;
+        }
+        return SB_OK;
+      },
+      err_out);
+}
+
+sb_status sb_load_params(const char *path, const char *const *names,
+                         sb_tensor *const *params, size_t count,
+                         sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!path)
+          return fail_arg(err_out);
+        if (count > 0 && (!names || !params))
+          return fail_arg(err_out);
+
+        std::unordered_map<std::string, size_t> target;
+        target.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+          if (!names[i] || !params[i])
+            return fail_arg(err_out);
+          std::string name(names[i]);
+          if (!target.emplace(std::move(name), i).second) {
+            set_error(err_out, SB_ERRKIND_BINDING,
+                      "duplicate requested checkpoint entry");
+            return SB_ERR_BINDING;
+          }
+        }
+
+        std::vector<std::uint8_t> bytes;
+        std::string why;
+        if (!read_whole_file(path, bytes, why)) {
+          set_error(err_out, SB_ERRKIND_WEIGHT, why.c_str());
+          return SB_ERR_WEIGHT;
+        }
+        CheckpointReader rd(bytes.data(), bytes.size());
+
+        char magic[sizeof(kCheckpointMagic)];
+        if (!rd.take(magic, sizeof(magic)) ||
+            std::memcmp(magic, kCheckpointMagic, sizeof(magic)) != 0) {
+          set_error(err_out, SB_ERRKIND_WEIGHT,
+                    "not a SonicBoom checkpoint file");
+          return SB_ERR_WEIGHT;
+        }
+        uint64_t entries = 0;
+        if (!rd.u64(entries)) {
+          set_error(err_out, SB_ERRKIND_WEIGHT, "truncated checkpoint header");
+          return SB_ERR_WEIGHT;
+        }
+        // Every entry has a header larger than 16 bytes, so a count that
+        // cannot possibly fit in the remaining bytes is corruption.
+        if (entries > rd.remaining() / 16) {
+          set_error(err_out, SB_ERRKIND_WEIGHT, "truncated checkpoint");
+          return SB_ERR_WEIGHT;
+        }
+
+        std::vector<char> matched(count, 0);
+        std::vector<std::vector<std::uint8_t>> staged(count);
+        std::unordered_set<std::string> seen;
+
+        for (uint64_t e = 0; e < entries; ++e) {
+          uint32_t name_len = 0;
+          if (!rd.u32(name_len) || name_len == 0 ||
+              name_len > kCheckpointMaxName || name_len > rd.remaining()) {
+            set_error(err_out, SB_ERRKIND_WEIGHT, "malformed checkpoint entry");
+            return SB_ERR_WEIGHT;
+          }
+          std::string name(reinterpret_cast<const char *>(rd.here()), name_len);
+          rd.skip(name_len);
+
+          uint8_t dtype = 0;
+          uint32_t rank = 0;
+          if (!rd.u8(dtype) || !rd.u32(rank) || rank > kCheckpointMaxRank) {
+            set_error(err_out, SB_ERRKIND_WEIGHT, "malformed checkpoint entry");
+            return SB_ERR_WEIGHT;
+          }
+          std::vector<int64_t> dims(rank);
+          for (uint32_t d = 0; d < rank; ++d) {
+            if (!rd.i64(dims[d])) {
+              set_error(err_out, SB_ERRKIND_WEIGHT,
+                        "truncated checkpoint entry");
+              return SB_ERR_WEIGHT;
+            }
+          }
+          uint64_t n = 0;
+          uint64_t numel = 0;
+          if (!rd.u64(n) || !checkpoint_numel(dims, numel) ||
+              numel > UINT64_MAX / sizeof(float)) {
+            set_error(err_out, SB_ERRKIND_WEIGHT, "malformed checkpoint entry");
+            return SB_ERR_WEIGHT;
+          }
+          if (dtype != SB_DTYPE_FLOAT32 ||
+              n != numel * static_cast<uint64_t>(sizeof(float))) {
+            set_error(err_out, SB_ERRKIND_WEIGHT,
+                      "checkpoint entry dtype or byte count is invalid");
+            return SB_ERR_WEIGHT;
+          }
+          if (!seen.insert(name).second) {
+            set_error(err_out, SB_ERRKIND_WEIGHT,
+                      "checkpoint contains a duplicate entry name");
+            return SB_ERR_WEIGHT;
+          }
+
+          auto it = target.find(name);
+          if (it != target.end()) {
+            const size_t idx = it->second;
+            const nt::Tensor &t = params[idx]->t;
+            if (t.dtype() != nt::ScalarType::Float ||
+                t.sizes() != dims) {
+              const std::string msg =
+                  "checkpoint entry '" + name +
+                  "' does not match the target tensor's dtype/shape";
+              set_error(err_out, SB_ERRKIND_BINDING, msg.c_str());
+              return SB_ERR_BINDING;
+            }
+            staged[idx].assign(rd.here(), rd.here() + n);
+            matched[idx] = 1;
+          }
+          if (!rd.skip(static_cast<std::size_t>(n))) {
+            set_error(err_out, SB_ERRKIND_WEIGHT, "truncated checkpoint entry");
+            return SB_ERR_WEIGHT;
+          }
+        }
+        if (rd.remaining() != 0) {
+          set_error(err_out, SB_ERRKIND_WEIGHT,
+                    "checkpoint has trailing bytes");
+          return SB_ERR_WEIGHT;
+        }
+        for (size_t i = 0; i < count; ++i) {
+          if (!matched[i]) {
+            const std::string msg =
+                "checkpoint has no entry named '" + std::string(names[i]) + "'";
+            set_error(err_out, SB_ERRKIND_BINDING, msg.c_str());
+            return SB_ERR_BINDING;
+          }
+        }
+
+        // Fully validated: commit every target.
+        for (size_t i = 0; i < count; ++i) {
+          if (!staged[i].empty())
+            std::memcpy(params[i]->t.data_ptr(), staged[i].data(),
+                        staged[i].size());
         }
         return SB_OK;
       },

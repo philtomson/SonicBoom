@@ -37,7 +37,7 @@
 #if defined(SONICBOOM_USE_CUDA)
 #include "../nn/cuda_graph.h"
 #include "../nn/cuda_stream.h"
-#include <nvToolsExt.h>
+#include <nvtx3/nvToolsExt.h>  // header-only NVTX (no libnvtx link)
 namespace sbstream = sonicboom::cuda;
 #define SB_DEV_MEMCPY_H2D cudaMemcpyAsync
 #define SB_DEV_MEMCPY_H2D_KIND cudaMemcpyHostToDevice
@@ -46,6 +46,9 @@ namespace sbstream = sonicboom::cuda;
 #include "../nn/hip_graph.h"
 #include "../nn/hip_stream.h"
 namespace sbstream = sonicboom::hip;
+// No NVTX on the AMD path: nvtx3 is a CUDA-toolkit header, and the ranges are
+// opt-in markers (SONICBOOM_NVTX) that only matter for an nsys profile, so they
+// are no-ops here rather than a dependency.
 inline void nvtxRangePushA(const char*) {}
 inline void nvtxRangePop() {}
 #define SB_DEV_MEMCPY_H2D hipMemcpyAsync

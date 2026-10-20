@@ -84,6 +84,32 @@ inline BackendTag route_op(OpKind op) noexcept {
     // A compiler-generated glue region has no MLIR-S-Expr lowering; it is a
     // device kernel like the quant::* ops around it.
     case OpKind::FusedRegion:
+    // Training updates run as hand-written kernels over the parameter's own
+    // device buffers; they have no MLIR-S-Expr lowering either.
+    case OpKind::AdamW:
+    // The training backward ops are hand-written kernels over device buffers;
+    // there is no S-Expr lowering for them either.
+    case OpKind::MatmulBwd:
+    case OpKind::SoftmaxBwd:
+    case OpKind::CrossEntropyBwd:
+    case OpKind::RmsNormBwd:
+    case OpKind::RopeBwd:
+    case OpKind::SiluMulBwd:
+    case OpKind::EmbeddingBwd:
+    // Training forward vocabulary: dense matmul/bmm, layout and reduction
+    // primitives, and the fused SwiGLU/CE forms. Like the backward ops they
+    // run as hand-written kernels over device buffers; the trained graph is
+    // executed by the device training graph executor, not a plan emitter.
+    case OpKind::Matmul:
+    case OpKind::Bmm:
+    case OpKind::Permute:
+    case OpKind::IndexSelect:
+    case OpKind::ReduceSum:
+    case OpKind::SiluMul:
+    case OpKind::CrossEntropy:
+    // Global-norm gradient clipping is a hand-written training kernel pair
+    // (one accumulation pass, one scale per gradient) over device buffers.
+    case OpKind::ClipGradNorm:
       return BackendTag::Sonic;
     default:
       return BackendTag::Mlir;

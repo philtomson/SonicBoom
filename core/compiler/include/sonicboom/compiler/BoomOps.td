@@ -410,4 +410,89 @@ def Boom_KvAppendOp : Boom_Op<"kv_append",
 def Boom_FusedRegionOp : Boom_Op<"fused_region",
     "compiler-generated glue region (e.g. rms_norm_quantize_q8_1)">;
 
+//--- training operators -----------------------------------------------------
+
+// AdamW: one fused parameter update written as a pure function. Operands are
+// [param, grad, m1, m2, step], where `step` is a one-element int32 tensor
+// (1-based); results are [param', m1', m2'] with the inputs' shapes. The
+// hyperparameters (lr, beta1, beta2, eps, weight_decay) ride on node_attrs; an
+// optional sixth operand, a one-element float32 lr tensor, overrides the `lr`
+// attribute and lets one graph serve a whole schedule. Results are new
+// tensors, not aliases: a traced training step reads them back as the next
+// state, which keeps the same node on every step.
+def Boom_AdamWOp : Boom_Op<"adamw",
+    "fused AdamW parameter update (decoupled weight decay)">;
+
+// clip_grad_norm: global-norm gradient clipping written as a pure function.
+// Operands are N gradients; results are the N clipped gradients, each with its
+// operand's shape, and `max_norm` rides on node_attrs. The global L2 norm is
+// accumulated in double in one pass over every element of every operand. When
+// it does not exceed max_norm each result is a copy of its operand (the values
+// are unchanged); otherwise each is scaled by max_norm / (norm + 1e-6).
+def Boom_ClipGradNormOp : Boom_Op<"clip_grad_norm",
+    "global-norm gradient clipping over N gradients">;
+
+// matmul_bwd: the VJP of Y = A @ B (A [M,K], B [K,N], dY [M,N]) with respect
+// to both operands. Operands [A, B, dY]; results [dA [M,K], dB [K,N]]. The
+// row-major layouts are the forward matmul's: A[m*K + k], B[k*N + n],
+// dY[m*N + n], dA[m*K + k], dB[k*N + n].
+def Boom_MatmulBwdOp : Boom_Op<"matmul_bwd",
+    "backward of matmul: dA = dY @ B^T, dB = A^T @ dY">;
+
+// softmax_bwd: the VJP of a last-axis softmax. Operands [Y, dY] where Y is the
+// forward output (softmax of the logits) and dY the upstream gradient; result
+// [dX], same [rows, cols] shape. dX = Y * (dY - sum_col(dY * Y)).
+def Boom_SoftmaxBwdOp : Boom_Op<"softmax_bwd",
+    "backward of last-axis softmax">;
+
+// cross_entropy_bwd: fused mean cross-entropy over rows and its gradient.
+// Operands [logits [R,C] f32, targets [R] int32]; results [loss (rank-0 f32,
+// the mean over rows), dlogits [R,C]]. The gradient written is the one of that
+// mean loss: (softmax(logits) - onehot(target)) / R.
+def Boom_CrossEntropyBwdOp : Boom_Op<"cross_entropy_bwd",
+    "fused mean cross-entropy loss and its gradient">;
+
+// rmsnorm_bwd: the VJP of y = x * rsqrt(mean_d(x^2) + eps) * w. Operands
+// [x [R,D], w [D], dY [R,D]]; results [dX [R,D], dW [D]]. `eps` is the
+// forward epsilon and rides on node_attrs.
+def Boom_RmsNormBwdOp : Boom_Op<"rmsnorm_bwd",
+    "backward of RMSNorm: dX and the per-column dW">;
+
+// rope_bwd: the inverse GPT-NeoX rotation of the upstream gradient. Operand
+// [dY [R, H*D]] (head-major); result [dX]. The rotation is orthogonal and its
+// angle depends only on the row's position, so no forward activation is read.
+// Attributes on node_attrs: head_dim, theta_base, freq_scale, pos0.
+def Boom_RopeBwdOp : Boom_Op<"rope_bwd",
+    "backward of GPT-NeoX RoPE (inverse rotation)">;
+
+// silu_mul_bwd: the VJP of the SwiGLU gate z = silu(g) * u. Operands
+// [g, u, dZ]; results [dG, dU], all elementwise with the same shape.
+def Boom_SiluMulBwdOp : Boom_Op<"silu_mul_bwd",
+    "backward of the SwiGLU gated activation">;
+
+// embedding_bwd: the VJP of the row gather y[r,:] = W[tokens[r],:]. Operands
+// [tokens [R] int32, dY [R,D]]; result [dW [V,D]]. dW is written in full, so
+// it needs no zero-fill; repeated tokens accumulate into one row.
+def Boom_EmbeddingBwdOp : Boom_Op<"embedding_bwd",
+    "backward of embedding lookup (scatter-add into the weight gradient)">;
+
+// The forward operators of an explicitly differentiated training graph. They
+// are dense-matmul and elementwise primitives with no model-bound weight, so
+// every operand is a plain Boom value and all their attributes ride on
+// node_attrs.
+def Boom_MatmulOp : Boom_Op<"matmul",
+    "dense matmul A [M,K] @ B [K,N]">;
+def Boom_BmmOp : Boom_Op<"bmm",
+    "batched matmul A [B,M,K] @ B [B,K,N]">;
+def Boom_PermuteOp : Boom_Op<"permute",
+    "reorder axes; `dims` on node_attrs">;
+def Boom_IndexSelectOp : Boom_Op<"index_select",
+    "gather rows along `axis`; operands [table, indices]">;
+def Boom_ReduceSumOp : Boom_Op<"reduce_sum",
+    "sum over `axes` (`keepdims` on node_attrs)">;
+def Boom_SiluMulOp : Boom_Op<"silu_mul",
+    "silu(gate) * up (SwiGLU)">;
+def Boom_CrossEntropyOp : Boom_Op<"cross_entropy",
+    "mean cross-entropy loss; operands [logits, targets]">;
+
 #endif // SONICBOOM_COMPILER_BOOMOPS_TD

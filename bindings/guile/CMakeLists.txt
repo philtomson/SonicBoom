@@ -26,6 +26,33 @@ if(GUILE_EXECUTABLE)
             -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-tensor.scm)
 
+  # guile-bpe trains and round-trips a byte-level BPE tokenizer; pure Scheme,
+  # no native library dependency.
+  add_test(
+    NAME guile-bpe
+    COMMAND ${CMAKE_COMMAND} -E env GUILE_AUTO_COMPILE=0
+            ${GUILE_EXECUTABLE} --no-auto-compile
+            -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/tokenizer/test-bpe.scm)
+
+  # guile-loader streams text/JSONL files into packed int32 batches; pure
+  # Scheme, no native library dependency.
+  add_test(
+    NAME guile-loader
+    COMMAND ${CMAKE_COMMAND} -E env GUILE_AUTO_COMPILE=0
+            ${GUILE_EXECUTABLE} --no-auto-compile
+            -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/test-loader.scm)
+
+  # guile-lr-schedule checks the warmup / cosine / constant learning-rate
+  # schedules; pure Scheme, no native library dependency.
+  add_test(
+    NAME guile-lr-schedule
+    COMMAND ${CMAKE_COMMAND} -E env GUILE_AUTO_COMPILE=0
+            ${GUILE_EXECUTABLE} --no-auto-compile
+            -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/train/test-lr-schedule.scm)
+
   # guile-nn loads libsonicboom.so (built by the `sonicboom` target), so put its
   # directory on LD_LIBRARY_PATH for the dynamic-link call.
   add_test(
@@ -47,6 +74,18 @@ if(GUILE_EXECUTABLE)
             ${GUILE_EXECUTABLE} --no-auto-compile
             -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-train.scm)
+
+  # guile-checkpoint round-trips named float32 tensors (parameters and AdamW
+  # moments) through (sonicboom checkpoint) → sb_save_params/sb_load_params,
+  # including the error paths; same shared-library dependency as guile-nn.
+  add_test(
+    NAME guile-checkpoint
+    COMMAND ${CMAKE_COMMAND} -E env
+            GUILE_AUTO_COMPILE=0
+            LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+            ${GUILE_EXECUTABLE} --no-auto-compile
+            -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-checkpoint.scm)
 
   # guile-executable compiles a graph once and runs it repeatedly through
   # libsonicboom.so, checking numerics, reuse and handle lifetime; same
@@ -71,6 +110,42 @@ if(GUILE_EXECUTABLE)
             ${GUILE_EXECUTABLE} --no-auto-compile
             -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-trace-lower.scm)
+
+  # guile-train-tiny traces a whole tiny Transformer training step (forward,
+  # `backward!`, fused AdamW), compiles it with sb_compile_device and runs it
+  # on the GPU, checking every parameter gradient against the pure-Scheme
+  # reference (1e-5) and that the loss falls. Same shared-library dependency
+  # as guile-nn, plus the GPU.
+  add_test(
+    NAME guile-train-tiny
+    COMMAND ${CMAKE_COMMAND} -E env
+            GUILE_AUTO_COMPILE=0
+            LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+            ${GUILE_EXECUTABLE} --no-auto-compile
+            -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/trace/test-train-tiny.scm)
+  # It is a correctness test whose time is dominated by the pure-Scheme
+  # reference interpreter (~50 s of ~57 s), so it is labelled "long": the
+  # default suite runs `ctest -LE long`, and the nightly/weekly CI job runs
+  # `ctest -L long`. It still takes the GPU lock when it does run.
+  set_tests_properties(guile-train-tiny PROPERTIES
+    LABELS long
+    RESOURCE_LOCK gpu_vram)
+
+  # test_adamw_lr_input (D2) runs ten AdamW steps with a schedule delivered as
+  # a learning-rate tensor, checks that all ten share one compiled segment (the
+  # attribute form needs one per rate), compares the loss curve against the
+  # attribute form and the interpreter, and exercises the
+  # SONICBOOM_ADAMW_LR_ATTR=1 ablation switch. GPU-bound like guile-train-tiny.
+  add_test(
+    NAME test_adamw_lr_input
+    COMMAND ${CMAKE_COMMAND} -E env
+            GUILE_AUTO_COMPILE=0
+            LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+            ${GUILE_EXECUTABLE} --no-auto-compile
+            -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/trace/test-adamw-lr-input.scm)
+  set_tests_properties(test_adamw_lr_input PROPERTIES RESOURCE_LOCK gpu_vram)
 
   # guile-nn-trace runs a `sequential` model through both
   # routes — the emitted-text forward pass and the traced/lowered one — and
@@ -101,7 +176,10 @@ if(GUILE_EXECUTABLE)
     # model tests (tests/core/CMakeLists.txt): two of those at once do not fit
     # on this device, and this one fails beside one of them with "device buffer
     # allocation failed".
-    set_tests_properties(guile-inference PROPERTIES RESOURCE_LOCK gpu_vram)
+    # It loads the real GGUF and generates tokens, so it is a model-driven
+    # golden like the C++ end-to-end suites: nightly/weekly, not per commit.
+    set_tests_properties(guile-inference PROPERTIES
+      RESOURCE_LOCK gpu_vram LABELS long)
 
   # guile-serve-http drives the OpenAI-compatible server (serve/app.scm) end to
   # end — plain JSON, SSE over a raw socket, a WebSocket — against the mock

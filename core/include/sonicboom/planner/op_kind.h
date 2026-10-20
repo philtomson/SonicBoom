@@ -93,6 +93,75 @@ enum class OpKind : uint8_t {
   // `fused_region` string attribute; the node keeps the op it replaced as its
   // name, so the region and the kernel that runs it are both identified there.
   FusedRegion,
+
+  // Training: one fused AdamW update of a parameter (decoupled weight decay).
+  // Operands are [param, grad, m1, m2, step], where `step` is a one-element
+  // int32 tensor holding the 1-based update index the bias correction needs.
+  // The hyperparameters (lr, beta1, beta2, eps, weight_decay) ride on the
+  // node's attributes; an optional sixth operand, a one-element float32
+  // learning-rate tensor, overrides the `lr` attribute. Results are
+  // [param', m1', m2'].
+  AdamW,
+
+  // Training: backward operators of the explicit reverse-mode graph.
+  //
+  // matmul_bwd: operands [A, B, dY] for the forward Y = A @ B with A [M,K],
+  // B [K,N], dY [M,N]; results [dA [M,K], dB [K,N]].
+  // softmax_bwd: operands [Y, dY] where Y is a last-axis softmax output;
+  // result [dX] with the same shape.
+  // cross_entropy_bwd: operands [logits [R,C], targets [R] int32]; results
+  // [loss (scalar f32, mean over rows), dlogits [R,C]].
+  MatmulBwd,
+  SoftmaxBwd,
+  CrossEntropyBwd,
+  //
+  // rmsnorm_bwd: operands [x [R,D], w [D], dY [R,D]]; results [dX [R,D],
+  // dW [D]]. `eps` rides on node_attrs.
+  // rope_bwd: operands [dY [R, H*D]]; result [dX]. Attributes: head_dim,
+  // theta_base, freq_scale, and `pos0` (the position of row 0).
+  // silu_mul_bwd: operands [g, u, dZ]; results [dG, dU], all the same shape.
+  // embedding_bwd: operands [tokens [R] int32, dY [R,D]]; result
+  // [dW [V,D]], written in full.
+  RmsNormBwd,
+  RopeBwd,
+  SiluMulBwd,
+  EmbeddingBwd,
+
+  // Training: the forward operators a traced training graph needs that the
+  // inference vocabulary above does not carry. They are the dense-matmul and
+  // elementwise primitives of an explicitly differentiated graph:
+  //
+  // matmul: operands [A [M,K], B [K,N]]; result [M,N].
+  // bmm: operands [A [B,M,K], B [B,K,N]]; result [B,M,N].
+  // permute: operand X; attribute `dims` (the permutation); result with the
+  //   permuted shape.
+  // index_select: operands [table, indices [R] int32]; attribute `axis`;
+  //   result gathers along that axis (the embedding lookup at axis 0).
+  // reduce_sum: operand X; attributes `axes`, `keepdims`; result the sum over
+  //   those axes.
+  // silu_mul: operands [gate, up]; result silu(gate) * up.
+  // cross_entropy: operands [logits [R,C], targets [R] int32]; result the mean
+  //   negative log-likelihood (a rank-0 f32 value).
+  //
+  // The device training graph executor dispatches these to hand-written CUDA
+  // kernels (core/src/training/device_graph.cu); no inference plan emits them.
+  Matmul,
+  Bmm,
+  Permute,
+  IndexSelect,
+  ReduceSum,
+  SiluMul,
+  CrossEntropy,
+
+  // Training: global-norm gradient clipping written as a pure function over N
+  // gradients. Operands are the gradients, results the clipped gradients with
+  // the operands' shapes; `max_norm` rides on node_attrs. The global L2 norm is
+  // accumulated in double in one pass over every element; when it does not
+  // exceed max_norm the results are copies of the operands (the values are
+  // unchanged), otherwise each is scaled by max_norm / (norm + 1e-6).
+  // Appended last: OpKind is an internal enum, but appending keeps the numeric
+  // values of the operators above stable across this change.
+  ClipGradNorm,
 };
 
 // Map a canonical operator name (e.g. "conv", "rms_norm") to its OpKind;

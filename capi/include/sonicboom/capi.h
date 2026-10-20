@@ -40,6 +40,7 @@ typedef struct sb_executable sb_executable;  /* a compiled, runnable graph     *
 typedef struct sb_error sb_error;            /* a failure detail               */
 typedef struct sb_tensor sb_tensor;          /* a float32 tensor (autograd)     */
 typedef struct sb_tape sb_tape;              /* a differentiable-op tape        */
+typedef struct sb_param sb_param;            /* a trainable param + AdamW state */
 
 /* Status codes. 0 == success; every non-zero value is a failure. */
 typedef enum sb_status {
@@ -157,6 +158,19 @@ sb_status sb_parse(const char *text, size_t len, sb_document **doc_out,
 sb_status sb_compile(const sb_document *doc, const char *base_dir,
                      sb_executable **exe_out, sb_error **err_out);
 
+/* Compile a parsed document as a device training graph. The document is the
+ * forward+backward+step graph a traced training function produced: it is
+ * lowered Blade -> Boom IR, run through the Boom IR Training pass phase, and
+ * executed node by node on the GPU (CUDA). The graph is bound by name — the
+ * tracer names every tensor argument — through sb_input_name_at /
+ * sb_output_name_at, and a step runs through sb_run_multi. Parameters must be
+ * inline (`data :values`); external weight sidecars are not supported. On a
+ * build without CUDA this fails with SB_ERR_COMPILE and a message saying so;
+ * the graph is still lowered and verified first, so a bad graph is reported as
+ * such on either build. Release with sb_executable_free. */
+sb_status sb_compile_device(const sb_document *doc, sb_executable **exe_out,
+                            sb_error **err_out);
+
 /* --- I/O introspection (bind) ---------------------------------------------- */
 
 /* Query the single input/output tensor. `dims_out`, if non-NULL, is set to a
@@ -169,6 +183,30 @@ sb_status sb_input_info(const sb_executable *exe, sb_dtype *dtype_out,
 sb_status sb_output_info(const sb_executable *exe, sb_dtype *dtype_out,
                          int64_t *rank_out, const int64_t **dims_out,
                          uint64_t *num_bytes_out);
+
+/* Graph arity and per-index introspection. A graph may have several inputs and
+ * several outputs (a training graph typically returns one gradient per
+ * parameter). sb_input_info/sb_output_info describe index 0; the *_info_at
+ * forms describe any index in [0, count). An index out of range is
+ * SB_ERR_INTERNAL (invalid argument). */
+sb_status sb_input_count(const sb_executable *exe, size_t *count_out);
+sb_status sb_output_count(const sb_executable *exe, size_t *count_out);
+sb_status sb_input_info_at(const sb_executable *exe, size_t index,
+                           sb_dtype *dtype_out, int64_t *rank_out,
+                           const int64_t **dims_out, uint64_t *num_bytes_out);
+sb_status sb_output_info_at(const sb_executable *exe, size_t index,
+                            sb_dtype *dtype_out, int64_t *rank_out,
+                            const int64_t **dims_out,
+                            uint64_t *num_bytes_out);
+
+/* Tensor names in binding order. `*name_out` is a borrowed NUL-terminated
+ * string valid until the executable is freed, or NULL when the compiled form
+ * does not retain names (the CPU interpreter compiled by sb_compile). A
+ * device training graph always names its tensors: the tracer's names. */
+sb_status sb_input_name_at(const sb_executable *exe, size_t index,
+                           const char **name_out);
+sb_status sb_output_name_at(const sb_executable *exe, size_t index,
+                            const char **name_out);
 
 /* --- Execute / retrieve ---------------------------------------------------- */
 
@@ -185,6 +223,22 @@ sb_status sb_execute(sb_executable *exe, sb_error **err_out);
  * `*written_out` is the output byte count (== the output num_bytes). */
 sb_status sb_retrieve_output(sb_executable *exe, void *out, size_t cap,
                              size_t *written_out, sb_error **err_out);
+
+/* Run the graph over N inputs and M outputs in one call — the general form
+ * behind sb_bind_input/sb_execute/sb_retrieve_output (the 1-in/1-out wrapper).
+ * `num_inputs` must equal sb_input_count and `num_outputs` must equal
+ * sb_output_count. Every input is copied, so the caller may free it as soon as
+ * this returns; `input_lens[i]` must equal that input's num_bytes.
+ * `output_data[i]` must have capacity at least the i-th output's num_bytes and
+ * `output_caps[i]` carries that capacity; capacities are checked before the
+ * graph runs. On success each result is copied into `output_data[i]` and, when
+ * `output_lens` is non-NULL, `output_lens[i]` receives the byte count written.
+ * On failure no result buffer is modified. */
+sb_status sb_run_multi(sb_executable *exe, const void *const *input_data,
+                       const size_t *input_lens, size_t num_inputs,
+                       void *const *output_data, const size_t *output_caps,
+                       size_t num_outputs, size_t *output_lens,
+                       sb_error **err_out);
 
 /* --- Release --------------------------------------------------------------- */
 
@@ -209,6 +263,48 @@ sb_status sb_tensor_bytes(const sb_tensor *t, void *out, size_t cap,
                           size_t *written_out, sb_error **err_out);
 
 void sb_tensor_free(sb_tensor *t);
+
+/* --- Training: parameter + fused AdamW -------------------------------------- */
+/* A trainable float32 parameter owns its values, its gradient, and AdamW's two
+ * moment buffers. When a CUDA device is present the four buffers stay in device
+ * memory across steps and the update is one fused kernel launch; otherwise they
+ * are host buffers and the host reference runs. The handle hides which.
+ *
+ * `dims[0..rank)` (row-major) only determine the element count; `len` must
+ * equal numel * 4 and supplies the initial values. The gradient and both moment
+ * buffers start at zero. */
+
+sb_status sb_param_create(const int64_t *dims, int64_t rank, const void *init,
+                          size_t len, sb_param **out, sb_error **err_out);
+
+/* Element count, and whether the buffers are device-resident (1) or host
+ * (0). Both are always available once the handle exists. */
+sb_status sb_param_numel(const sb_param *p, size_t *numel_out);
+int sb_param_on_device(const sb_param *p);
+
+/* Updates applied so far (0 before the first successful sb_param_step). */
+uint64_t sb_param_step_count(const sb_param *p);
+
+/* Zero the gradient, replace it with `grad` (len == numel * 4), and apply one
+ * AdamW update. `sb_param_read` copies the current parameter values out. */
+sb_status sb_param_zero_grad(sb_param *p, sb_error **err_out);
+sb_status sb_param_set_grad(sb_param *p, const void *grad, size_t len,
+                            sb_error **err_out);
+sb_status sb_param_step(sb_param *p, float lr, float beta1, float beta2,
+                        float eps, float weight_decay, sb_error **err_out);
+
+/* The lr-input form: the learning rate is read from a one-element float32
+ * tensor (an sb_tensor handle, which is how a traced schedule carries the
+ * rate). The parameter's own buffers stay device-resident; only the single
+ * rate is read on the host. The handle's numel must be 1 and its dtype
+ * float32. */
+sb_status sb_param_step_lr(sb_param *p, const sb_tensor *lr, float beta1,
+                           float beta2, float eps, float weight_decay,
+                           sb_error **err_out);
+sb_status sb_param_read(const sb_param *p, void *out, size_t cap,
+                        size_t *written_out, sb_error **err_out);
+
+void sb_param_free(sb_param *p);
 
 /* Create an empty tape (no recorded ops, no gradients). */
 sb_status sb_tape_new(sb_tape **out, sb_error **err_out);
@@ -245,6 +341,15 @@ sb_status sb_sgd_step(sb_tape *tape, sb_tensor *param, double lr,
 sb_status sb_grad(const sb_tape *tape, const sb_tensor *param, sb_tensor **out,
                   sb_error **err_out);
 
+/* Clip a set of gradient tensors by their global L2 norm, in place. GRADS is
+ * COUNT float32 CPU tensors (the gradients read back with sb_grad, or any
+ * other gradient buffers); the norm is accumulated in double over every
+ * element of every tensor. When it exceeds MAX_NORM each tensor is scaled by
+ * MAX_NORM / (norm + 1e-6); otherwise the tensors are left byte-for-byte
+ * unchanged. *NORM_OUT, when non-NULL, receives the pre-clip global norm. */
+sb_status sb_clip_grad_norm(sb_tensor *const *grads, int count, float max_norm,
+                            float *norm_out, sb_error **err_out);
+
 /* --- Export ----------------------------------------------------------------- */
 
 /* Persist a trained model as a self-contained artifact directory (`dir`):
@@ -264,6 +369,43 @@ sb_status sb_grad(const sb_tape *tape, const sb_tensor *param, sb_tensor **out,
 sb_status sb_export_model(const char *sx_text, size_t sx_len,
                           const char *const *names, const sb_tensor *const *params,
                           size_t count, const char *dir, sb_error **err_out);
+
+/* --- Checkpoints ------------------------------------------------------------- */
+
+/* Named float32 tensors persisted in one self-describing binary file:
+ *
+ *   "SBCKPT1\n"                    8-byte magic
+ *   u64                            entry count
+ *   per entry:
+ *     u32 name_len, name bytes     UTF-8, not NUL-terminated
+ *     u8 dtype                     sb_dtype (float32 in this version)
+ *     u32 rank
+ *     i64 dims[rank]               row-major shape
+ *     u64 byte_count               == numel * 4
+ *     byte_count data bytes        little-endian float32, row-major
+ *
+ * All integers are little-endian. Entries are matched by name, so the order in
+ * which a caller saves and loads them need not agree.
+ *
+ * sb_save_params writes `count` named tensors to `path` (overwriting it).
+ * Names must be non-empty and unique; tensors must be float32. sb_load_params
+ * copies the stored values into the caller's existing tensors, matched by
+ * name: each target must be float32 with exactly the stored shape. The file is
+ * fully parsed and validated before any target is written, so on any failure
+ * every target is left untouched. The file may hold entries the caller does
+ * not load (a checkpoint can carry more state than one call needs), and one
+ * call may load a subset of its targets from several checkpoints.
+ *
+ * Errors: a missing, unreadable, truncated or malformed checkpoint is
+ * SB_ERR_WEIGHT; a name/shape/dtype mismatch between file and caller is
+ * SB_ERR_BINDING (also on save for duplicate names or a non-float32 tensor);
+ * an invalid argument is SB_ERR_INTERNAL. */
+sb_status sb_save_params(const char *path, const char *const *names,
+                         const sb_tensor *const *params, size_t count,
+                         sb_error **err_out);
+sb_status sb_load_params(const char *path, const char *const *names,
+                         sb_tensor *const *params, size_t count,
+                         sb_error **err_out);
 
 /* --- Inference (minimal LLM surface, sb_llm_*) ----------------------------- */
 /* A thin facade over the Layer 2 model loader + planner spine, exposing the

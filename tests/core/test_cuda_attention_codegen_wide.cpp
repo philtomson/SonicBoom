@@ -7,9 +7,9 @@
 // 512 -> 8 x 64), exchanges the partial S through shared memory and sums the
 // slices in warp order. The Qwen2.5 head (head_dim 64, GQA 7) fits one warp
 // and is covered by the same test: its generated kernel is checked against
-// fp64 and the batch-invariance contract like the wide heads, while
-// attn_auto_pick keeps the hand-written kernel for it (the prefill leg is
-// 1.7x faster there: 0.081 vs 0.138 ms at 256 queries).
+// fp64 and the batch-invariance contract like the wide heads. Since attn9
+// its prefill is the class default and is bit-identical to the hand-written
+// tiled kernel (`--shapes d64 tokens`).
 //
 // This test checks that path against an fp64 reference that simulates the
 // kernel's two roundings (f16 Q/K/V staging, f16 P), for both mask kinds and
@@ -267,7 +267,7 @@ struct ShapeCase {
   const char *causal_region;
   const char *window_region;
   // The implementation attn_auto_pick is expected to choose for this class
-  // (d64: own wins the prefill leg by 1.7x; d256/d512: codegen).
+  // (all three classes: generated prefill since attn9).
   bool auto_codegen = true;
 };
 
@@ -350,6 +350,67 @@ int run_bench(int prefill_n) {
   return 0;
 }
 
+// --- token identity: generated == hand-written, bitwise --------------------
+//
+// `--shapes d64 tokens [cfg]` runs the generated d64 kernel at the given tile
+// config (default: the generated default) and the hand-written kernel over the
+// same causal prefill, and requires every output element to match bitwise at
+// n = 128, 256, 512. This is the acceptance gate for making the generated d64
+// prefill the default: token streams can only match if the whole output
+// matches.
+int run_tokens(const std::string &shape, const char *cfg) {
+  if (shape != "d64") {
+    std::cerr << "unsupported --shapes " << shape << " (only d64)\n";
+    return 2;
+  }
+  const Cfg c{64, 2, 7, 14};
+  std::mt19937 rng(9100 + c.d);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  std::vector<float> kseq(size_t(TOTAL) * c.nhkv * c.d),
+      vseq(size_t(TOTAL) * c.nhkv * c.d),
+      qabs(size_t(TOTAL) * c.nhq * c.d);
+  for (auto &x : kseq) x = nd(rng);
+  for (auto &x : vseq) x = nd(rng);
+  for (auto &x : qabs) x = nd(rng);
+  DeviceBufs b;
+  if (!alloc_bufs(c, b)) {
+    std::cerr << "tokens: cudaMalloc failed\n";
+    return 1;
+  }
+  int failures = 0;
+  for (int n : {128, 256, 512}) {
+    std::vector<float> got_own, got_cg;
+    setenv("SONICBOOM_ATTN_IMPL", "own", 1);
+    unsetenv("SONICBOOM_ATTN_CODEGEN");
+    const bool ro = run_case(c, b, qabs, kseq, vseq, 0, n, 0, got_own);
+    setenv("SONICBOOM_ATTN_IMPL", "codegen", 1);
+    if (cfg != nullptr)
+      setenv("SONICBOOM_ATTN_CODEGEN", cfg, 1);
+    else
+      unsetenv("SONICBOOM_ATTN_CODEGEN");
+    const bool rc = run_case(c, b, qabs, kseq, vseq, 0, n, 0, got_cg);
+    if (!ro || !rc || got_own.size() != got_cg.size()) {
+      std::cerr << "  n=" << n << ": run failed (own=" << ro
+                << " codegen=" << rc << ")\n";
+      ++failures;
+      continue;
+    }
+    size_t diff = 0;
+    double maxabs = 0.0;
+    for (size_t z = 0; z < got_own.size(); ++z) {
+      if (std::bit_cast<uint32_t>(got_own[z]) !=
+          std::bit_cast<uint32_t>(got_cg[z]))
+        ++diff;
+      maxabs = std::max(maxabs, std::fabs(double(got_own[z]) - got_cg[z]));
+    }
+    std::printf("TOKENS d64 n=%d cfg=%s diff=%zu/%zu maxabs=%.3e %s\n", n,
+                cfg != nullptr ? cfg : "default", diff, got_own.size(), maxabs,
+                diff == 0 ? "IDENTICAL" : "DIFFER");
+    if (diff != 0) ++failures;
+  }
+  return failures == 0 ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -359,11 +420,14 @@ int main(int argc, char **argv) {
   }
   if (argc > 1 && std::string_view(argv[1]) == "--bench")
     return run_bench(argc > 2 ? std::atoi(argv[2]) : 256);
+  if (argc > 3 && std::string_view(argv[1]) == "--shapes" &&
+      std::string_view(argv[3]) == "tokens")
+    return run_tokens(argv[2], argc > 4 ? argv[4] : nullptr);
   setenv("SONICBOOM_ATTN_IMPL", "codegen", 1);
 
   const ShapeCase shapes[] = {
-      {{64, 2, 7, 14}, "attn-d64-g7-causal-b64x64-dps1",
-       "attn-d64-g7-window-b64x64-dps1", false},
+      {{64, 2, 7, 14}, "attn-d64-g7-causal-b64x32-dps1",
+       "attn-d64-g7-window-b64x32-dps1", true},
       {{256, 2, 4, 8}, "attn-d256-g4-causal-b64x16-dps4",
        "attn-d256-g4-window-b64x16-dps4"},
       {{512, 2, 4, 8}, "attn-d512-g4-causal-b32x16-dps8",

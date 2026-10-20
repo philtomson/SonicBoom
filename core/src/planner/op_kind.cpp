@@ -87,6 +87,38 @@ std::optional<OpKind> op_kind_from_name(std::string_view name) noexcept {
     return OpKind::AddBias;
   if (name == "fused_region")
     return OpKind::FusedRegion;
+  if (name == "adamw")
+    return OpKind::AdamW;
+  if (name == "matmul_bwd")
+    return OpKind::MatmulBwd;
+  if (name == "softmax_bwd")
+    return OpKind::SoftmaxBwd;
+  if (name == "cross_entropy_bwd")
+    return OpKind::CrossEntropyBwd;
+  if (name == "rmsnorm_bwd")
+    return OpKind::RmsNormBwd;
+  if (name == "rope_bwd")
+    return OpKind::RopeBwd;
+  if (name == "silu_mul_bwd")
+    return OpKind::SiluMulBwd;
+  if (name == "embedding_bwd")
+    return OpKind::EmbeddingBwd;
+  if (name == "matmul")
+    return OpKind::Matmul;
+  if (name == "bmm")
+    return OpKind::Bmm;
+  if (name == "permute")
+    return OpKind::Permute;
+  if (name == "index_select")
+    return OpKind::IndexSelect;
+  if (name == "reduce_sum")
+    return OpKind::ReduceSum;
+  if (name == "silu_mul")
+    return OpKind::SiluMul;
+  if (name == "cross_entropy")
+    return OpKind::CrossEntropy;
+  if (name == "clip_grad_norm")
+    return OpKind::ClipGradNorm;
   return std::nullopt;
 }
 
@@ -127,6 +159,22 @@ const char* op_kind_name(OpKind k) noexcept {
     case OpKind::FlashAttention: return "flash_attention";
     case OpKind::KvAppend: return "kv_append";
     case OpKind::FusedRegion: return "fused_region";
+    case OpKind::AdamW: return "adamw";
+    case OpKind::MatmulBwd: return "matmul_bwd";
+    case OpKind::SoftmaxBwd: return "softmax_bwd";
+    case OpKind::CrossEntropyBwd: return "cross_entropy_bwd";
+    case OpKind::RmsNormBwd: return "rmsnorm_bwd";
+    case OpKind::RopeBwd: return "rope_bwd";
+    case OpKind::SiluMulBwd: return "silu_mul_bwd";
+    case OpKind::EmbeddingBwd: return "embedding_bwd";
+    case OpKind::Matmul: return "matmul";
+    case OpKind::Bmm: return "bmm";
+    case OpKind::Permute: return "permute";
+    case OpKind::IndexSelect: return "index_select";
+    case OpKind::ReduceSum: return "reduce_sum";
+    case OpKind::SiluMul: return "silu_mul";
+    case OpKind::CrossEntropy: return "cross_entropy";
+    case OpKind::ClipGradNorm: return "clip_grad_norm";
   }
   return "?";
 }

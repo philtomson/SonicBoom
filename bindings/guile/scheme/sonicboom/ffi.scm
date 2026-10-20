@@ -126,6 +126,24 @@ the procedure name (\"dlopen\") and whose irritants carry the dlerror text."
                                                (list '* '* '* '* '*)))
                (sb_output_info . ,(foreign-proc "sb_output_info" int
                                                 (list '* '* '* '* '*)))
+               ;; device training graph (sb_compile_device) — see capi.h
+               (sb_compile_device . ,(foreign-proc "sb_compile_device" int
+                                                   (list '* '* '*)))
+               (sb_input_count . ,(foreign-proc "sb_input_count" int
+                                                (list '* '*)))
+               (sb_output_count . ,(foreign-proc "sb_output_count" int
+                                                 (list '* '*)))
+               (sb_input_info_at . ,(foreign-proc "sb_input_info_at" int
+                                                  (list '* size_t '* '* '* '*)))
+               (sb_output_info_at . ,(foreign-proc "sb_output_info_at" int
+                                                   (list '* size_t '* '* '* '*)))
+               (sb_input_name_at . ,(foreign-proc "sb_input_name_at" int
+                                                  (list '* size_t '*)))
+               (sb_output_name_at . ,(foreign-proc "sb_output_name_at" int
+                                                   (list '* size_t '*)))
+               (sb_run_multi . ,(foreign-proc "sb_run_multi" int
+                                              (list '* '* '* size_t '* '* size_t
+                                                    '* '*)))
                (sb_bind_input . ,(foreign-proc "sb_bind_input" int
                                                (list '* '* size_t '*)))
                (sb_execute . ,(foreign-proc "sb_execute" int (list '* '*)))
@@ -156,9 +174,16 @@ the procedure name (\"dlopen\") and whose irritants carry the dlerror text."
                (sb_sgd_step . ,(foreign-proc "sb_sgd_step" int
                                             (list '* '* double '*)))
                (sb_grad . ,(foreign-proc "sb_grad" int (list '* '* '* '*)))
+               (sb_clip_grad_norm . ,(foreign-proc "sb_clip_grad_norm" int
+                                                   (list '* int float '* '*)))
                ;; export: graph text + named trained tensors → artifact dir
                (sb_export_model . ,(foreign-proc "sb_export_model" int
                                                  (list '* size_t '* '* size_t '* '*)))
+               ;; checkpoints: named float32 tensors ↔ one binary file
+               (sb_save_params . ,(foreign-proc "sb_save_params" int
+                                                (list '* '* '* size_t '*)))
+               (sb_load_params . ,(foreign-proc "sb_load_params" int
+                                                (list '* '* '* size_t '*)))
                ;; inference (minimal LLM surface) — see capi.h sb_llm_*
                (sb_llm_model_load . ,(foreign-proc "sb_llm_model_load" int
                                                    (list '* '* '*)))

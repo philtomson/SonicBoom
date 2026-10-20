@@ -15,11 +15,25 @@ function(sb_add_cpp_test name)
                    $<TARGET_FILE:${name}>)
 endfunction()
 
-foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_mlir test_s_expr test_s_expr_lowering test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_qwen2_config test_qwen2_generate test_generate test_prefix_cache test_vocab test_plan_record test_plan_cache test_spec_invariance test_spec_rollback test_spec_program test_ngram_drafter test_runtime_features)
+foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_mlir test_s_expr test_s_expr_lowering test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_qwen2_config test_qwen2_generate test_generate test_prefix_cache test_vocab test_plan_record test_plan_cache test_spec_invariance test_spec_rollback test_spec_program test_spec_bootstrap test_ngram_drafter test_clip_grad_norm test_runtime_features)
   add_executable(${test_name} ${test_name}.cpp)
   target_link_libraries(${test_name} PRIVATE sonicboom)
   sb_add_cpp_test(${test_name})
 endforeach()
+
+# test_clip_grad_norm exercises the fused device kernels directly when the
+# library was built with CUDA (the internal kernel header is CUDA-only).
+if(SONICBOOM_USE_CUDA)
+  target_compile_definitions(test_clip_grad_norm PRIVATE SB_TEST_CUDA=1)
+  set_tests_properties(test_clip_grad_norm PROPERTIES RESOURCE_LOCK gpu_vram)
+endif()
+
+# The S1 drafter-coverage gate, registered under the spec-* family name so it
+# is selected with the other speculative-decode suites (`ctest -R spec`).
+add_test(NAME test_spec_drafter
+         COMMAND ${CMAKE_COMMAND} -E env
+                 LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+                 $<TARGET_FILE:test_ngram_drafter>)
 
 # The runtime-feature disable list is parsed once per process, so the mode that
 # needs a different value of it is a separate invocation. (The unknown-name
@@ -44,6 +58,14 @@ target_compile_definitions(test_gemma4 PRIVATE
 # repository-root requirement for locating models/.
 target_compile_definitions(test_qwen2_config PRIVATE
   SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
+
+# The host-only tests that read a real GGUF (dequantization diff, model load,
+# tokenizer) are correctness goldens over a multi-GB file, several seconds each
+# and skipped only when the GGUF is absent. They go with the rest of the
+# model-driven tests into the nightly/weekly suite. (test_qwen2_config stays in
+# the per-commit set: it parses the config header only, ~1 s.)
+set_tests_properties(test_dequant test_gemma4 test_vocab
+  PROPERTIES LABELS long)
 
 # test_qwen2_generate (Qwen2 prefill + greedy decode vs the llama.cpp golden
 # streams) needs the repository root to locate models/ and tests/data/qwen2/.
@@ -70,7 +92,7 @@ add_test(NAME test_prefix_cache_long
                  LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
                  $<TARGET_FILE:test_prefix_cache> --long)
 set_tests_properties(test_prefix_cache_long
-  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram)
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
 
 # test_vocab loads the real Gemma 4 GGUF tokenizer (skips cleanly when absent);
 # same repository-root requirement for locating models/.
@@ -84,7 +106,7 @@ target_compile_definitions(test_vocab PRIVATE
 target_compile_definitions(test_plan_record PRIVATE
   SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
 set_tests_properties(test_plan_record
-  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram)
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
 
 # test_plan_cache (prefill segment cache: a hit must be indistinguishable from a
 # fresh build) needs the repository root for models/, and the same CUDA + GGUF
@@ -92,7 +114,7 @@ set_tests_properties(test_plan_record
 target_compile_definitions(test_plan_cache PRIVATE
   SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
 set_tests_properties(test_plan_cache
-  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram)
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
 
 # test_spec_invariance (B3 verify-step invariance) needs both model GGUFs,
 # looked up relative to the repository root. It forks one child per
@@ -108,6 +130,17 @@ target_compile_definitions(test_spec_rollback PRIVATE
 # test_spec_program (B6 speculative loop) needs both model GGUFs, looked up
 # relative to the repository root; it forks one child per (model, depth) case.
 target_compile_definitions(test_spec_program PRIVATE
+  SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
+
+# test_spec_bootstrap (S2 adaptive cold-start bootstrap) needs the Qwen GGUF,
+# looked up the same way, and forks its child with SONICBOOM_SPEC left unset.
+target_compile_definitions(test_spec_bootstrap PRIVATE
+  SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
+
+# test_ngram_drafter's coverage case feeds the code-edit trace's source files
+# (the same files workload_bench pastes) through the drafter; it needs the
+# repository root to read them.
+target_compile_definitions(test_ngram_drafter PRIVATE
   SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
 
 # The GPU tests run one at a time (RESOURCE_LOCK gpu_vram).
@@ -142,10 +175,14 @@ target_compile_definitions(test_spec_program PRIVATE
 # Deliberately not locked: the tests that read a GGUF on the host without
 # touching the device (test_gguf, test_dequant, test_gemma4, test_qwen2_config,
 # test_vocab), and everything else in the suite — CPU-only tests stay parallel.
+# These are labelled long: each loads a real GGUF and runs a whole
+# prefill/decode or speculative session to compare against token goldens
+# (~15 s to ~2 min apiece, serialized by the device lock), so they belong to
+# the nightly/weekly suite rather than the per-commit one.
 set_tests_properties(test_generate test_qwen2_generate test_prefix_cache
                               test_spec_invariance test_spec_rollback
-                              test_spec_program
-  PROPERTIES RESOURCE_LOCK gpu_vram)
+                              test_spec_program test_spec_bootstrap
+  PROPERTIES RESOURCE_LOCK gpu_vram LABELS long)
 
 # The decode-chunk path (k greedy steps captured per graph, §10) is off by
 # default — autotuned to k=1, since the decode step is GPU-bound and chunking
@@ -157,7 +194,7 @@ add_test(NAME test_generate_decode_chunk
                  SONICBOOM_DECODE_CHUNK=4
                  $<TARGET_FILE:test_generate>)
 set_tests_properties(test_generate_decode_chunk
-  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram)
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
 
 # The speculative loop (SONICBOOM_SPEC, B6) is also parsed once per process.
 # Run the golden-stream checks with it on: the drafter's proposals must not
@@ -169,7 +206,7 @@ add_test(NAME test_generate_spec
                  SONICBOOM_SPEC=on
                  $<TARGET_FILE:test_generate>)
 set_tests_properties(test_generate_spec
-  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram)
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
 
 # B7's adaptive draft length (SONICBOOM_SPEC=auto) also goes through the same
 # golden streams: the warm-up's forced drafts and the policy's per-step k are
@@ -183,7 +220,7 @@ add_test(NAME test_generate_spec_auto
                  SONICBOOM_TUNE_DIR=${CMAKE_BINARY_DIR}/spec-auto-tune
                  $<TARGET_FILE:test_generate>)
 set_tests_properties(test_generate_spec_auto
-  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram)
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
 
 # The same coverage for the other consumer of the chunked loop: the
 # prefill-then-decode path (prefill_decode_cuda_impl) must produce the same
@@ -194,7 +231,7 @@ add_test(NAME test_qwen2_generate_decode_chunk
                  SONICBOOM_DECODE_CHUNK=4
                  $<TARGET_FILE:test_qwen2_generate>)
 set_tests_properties(test_qwen2_generate_decode_chunk
-  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram)
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
 
 # Real GPU closed-loop test. Only built when the CUDA or ROCm/HIP build is
 # enabled; at runtime it skips cleanly (exit 0) when no such device is present.
@@ -235,6 +272,17 @@ if(SONICBOOM_USE_CUDA OR SONICBOOM_USE_ROCM)
   set_tests_properties(test_cuda test_cuda_quant test_cuda_gather
                        test_cuda_elementwise test_gpu_gate
     PROPERTIES RESOURCE_LOCK gpu_vram)
+endif()
+
+# R3: backward ops (matmul, softmax, cross-entropy) — device kernels vs an
+# independent fp64 reference, plus finite-difference gradient checks. CUDA-only,
+# unlike the differential suites above: the test calls training::cuda::* entry
+# points directly and those kernels live in the CUDA source block (no ROCm twin
+# yet), so it cannot be built into a ROCm tree.
+if(SONICBOOM_USE_CUDA)
+  add_executable(test_backward_ops test_backward_ops.cpp)
+  target_link_libraries(test_backward_ops PRIVATE sonicboom)
+  sb_add_cpp_test(test_backward_ops)
 endif()
 
 # Compiler-generated kernel tests (MLIR -> NVVM -> PTX codegen + CUDA driver JIT).
@@ -380,6 +428,25 @@ add_executable(test_capi test_capi.c)
 target_link_libraries(test_capi PRIVATE sonicboom m)
 sb_add_cpp_test(test_capi)
 
+# Multi-input / multi-output C ABI: one graph returning both a+b and a*b,
+# driven through sb_run_multi and the per-index introspection.
+add_executable(test_capi_multi test_capi_multi.c)
+target_link_libraries(test_capi_multi PRIVATE sonicboom m)
+sb_add_cpp_test(test_capi_multi)
+
+# R2: SonicBoomParam + fused AdamW through the C ABI, 10 steps against an
+# independent double-precision reference (max-abs <= 1e-6).
+add_executable(test_adamw test_adamw.cpp)
+target_link_libraries(test_adamw PRIVATE sonicboom)
+sb_add_cpp_test(test_adamw)
+
+# R7: named parameter checkpoints through the C ABI. save → load is bit-exact
+# and load order independent; malformed files and name/shape mismatches are
+# rejected without touching any target.
+add_executable(test_checkpoint test_checkpoint.cpp)
+target_link_libraries(test_checkpoint PRIVATE sonicboom)
+sb_add_cpp_test(test_checkpoint)
+
 # Boom IR dialect test: op registration against planner::OpKind, the generated
 # assembly formats, the type verifiers. It links the compiler library
 # (sonicboom_compiler), which is always built — MLIR is a required dependency
@@ -415,4 +482,4 @@ sb_add_cpp_test(test_boom_conversion)
 # It loads both models onto the GPU for the plan gate, so it takes the same
 # lock as the other model tests (see "The model tests run one at a time").
 set_tests_properties(test_boom_conversion
-  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram)
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
