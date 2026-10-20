@@ -1,7 +1,10 @@
 # ROCm / Strix Halo Porting Plan
 
-Status: **active** — Phase 0-2 complete (branch `amd_dev`); Phase 4 started
-(vendor-neutral device gate landed), Phase 3 open.
+Status: **active** — Phase 0-2 complete (branch `amd_dev`), Phase 4 started
+(vendor-neutral device gate landed), Phase 3 open. `origin/master` merged in
+(bb8e43f): upstream's training/backward work is CUDA-gated in its host files,
+so the ROCm build takes it as host-only code; two conflicts (NVTX include,
+test registration) and one device-path fix in `training/param.cpp`.
 Target GPU: **AMD Radeon 8060S** (Strix Halo iGPU), **gfx1151** (RDNA 3.5,
 40 CUs). ROCm **7.x** (TheRock 10.1.0) at `/opt/rocm` (`hipcc`, `hipconfig`,
 `rocminfo`). `/dev/kfd` and `/dev/dri/renderD128` present; user is in the
@@ -134,11 +137,16 @@ Target GPU: **AMD Radeon 8060S** (Strix Halo iGPU), **gfx1151** (RDNA 3.5,
       `test_cuda_gather` OK, `test_cuda` skips (CUDA-specific Layer-2 path).
       CPU-core regression tests (`test_nn`, `test_dequant`, `test_tensor`,
       `test_backend`, `test_quantized_matmul`) still pass.
-- [x] **Full C++ suite on the ROCm build:** `ctest -E guile` = **67/67 pass**
-      (with the 5 expected SKIPs for absent model fixtures). The 7 failing
-      Guile tests are a separate, pre-existing prerequisite — `guile-json`
-      module missing (not ROCm-related); they need `sudo dnf install
-      guile-json`.
+- [x] **Full C++ suite on the ROCm build:** `ctest -E guile` = **74/74 pass**
+      (5 expected SKIPs for absent model fixtures). The Guile tests need the
+      `(json)` module — `guile-json` is **not** packaged in Fedora, so it was
+      built from source
+      (`https://download.savannah.gnu.org/releases/guile-json/guile-json-4.7.3.tar.gz`,
+      `./configure --prefix=$HOME/.local && make && make install`) and the
+      Guile tests run with `GUILE_LOAD_PATH=$HOME/.local/share/guile/site/3.0`.
+      With it present, the full suite is 74/74 and the Guile subset 14/14 on
+      the ROCm build. Not related to ROCm: the same module is missing on any
+      checkout here.
 - [x] Kernel-level numeric verification on the iGPU (elementwise + quant
       matvec/mmq vs CPU reference) via `test_cuda_elementwise` /
       `test_cuda_quant` / `test_cuda_gather`, which run on the ROCm build.
