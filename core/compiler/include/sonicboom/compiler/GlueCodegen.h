@@ -34,6 +34,7 @@
 // the region's output is byte-identical to the reference kernel's.
 
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -143,6 +144,36 @@ std::optional<std::string> generate_glue_hsaco(GlueRegionKind kind, int gfx_arch
 std::optional<std::string> lower_gpu_module_to_ptx(std::string_view mlir_text,
                                                    bool link_libdevice,
                                                    std::string_view what);
+
+// A gpu.func in a generated module and the block size its launcher uses. The
+// AMDGPU path must declare the size on the function: the ROCDL LLVM IR
+// translation otherwise stamps every kernel with a 1..256 launch bound.
+struct AmdKernelBlock {
+  std::string_view name;
+  int threads;
+};
+
+// Retarget a GPU-dialect module text that carries an NVVM target attribute to
+// the AMDGPU backend: swap that attribute for `#rocdl.target` on `gfx_arch`,
+// pin wave32 (the generated shuffle/reduction trees are 32 lanes), declare
+// `gpu.known_block_size` on every kernel listed in `kernels`, and rewrite the
+// NVVM-only ops the ROCDL path cannot lower (see lower_gpu_module_to_hsaco).
+// The result is ready for lower_gpu_module_to_hsaco. Shared by the glue,
+// attention and GEMM generators, so all three AMDGPU kernels go through one
+// retargeting.
+std::string amdgpu_adapt_module_text(std::string_view mlir_text, int gfx_arch,
+                                     std::span<const AmdKernelBlock> kernels);
+
+// Lower a textual GPU-dialect module to an HSA code object (HSACO) through the
+// ROCDL pipeline, the AMDGPU twin of lower_gpu_module_to_ptx. The module must
+// already carry the `#rocdl.target` attribute: produce it with
+// amdgpu_adapt_module_text. `link_libdevice` is unused (the ROCDL serializer
+// resolves the device libraries itself). `what` names the source in
+// diagnostics. The serializer needs a ROCm toolkit at run time for its final
+// lld link. Returns nullopt on any failure. Only meaningful on a ROCm build.
+std::optional<std::string> lower_gpu_module_to_hsaco(std::string_view mlir_text,
+                                                     bool link_libdevice,
+                                                     std::string_view what);
 
 // The identity of the compiler that produces that PTX: the linked LLVM version
 // plus this generator's revision. The JIT disk cache stamps it into every entry

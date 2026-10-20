@@ -131,6 +131,37 @@ std::string validate_entry(const std::string &text, const std::string &region,
   return body;
 }
 
+bool use_disk_cache() {
+  // SONICBOOM_GLUE_CACHE=0 bypasses the disk cache (read and write): the
+  // ablation for "is this the cached kernel or the one this compiler builds".
+  static const bool use = [] {
+    const char *e = std::getenv("SONICBOOM_GLUE_CACHE");
+    return !(e != nullptr && std::string_view(e) == "0");
+  }();
+  return use;
+}
+
+// The cache key of a shape class: the fields the emitted kernel text depends
+// on. Shared by both backends (the file suffix carries the arch).
+std::string attention_region_name(const compiler::AttentionShape &shape) {
+  const std::string mask = shape.window_mask ? "-window" : "-causal";
+  if (shape.decode)
+    return "attn-dec-d" + std::to_string(shape.head_dim) + "-g" +
+           std::to_string(shape.gqa) + mask;
+  return "attn-d" + std::to_string(shape.head_dim) + "-g" +
+         std::to_string(shape.gqa) + mask + "-b" + std::to_string(shape.br) +
+         "x" + std::to_string(shape.bc) + "-dps" + std::to_string(shape.dps) +
+         (shape.warp_head ? "-wh" : "") +
+         (shape.async_stages >= 2 ? "-as" + std::to_string(shape.async_stages)
+                                  : "") +
+         (shape.exp2 ? "-x2" : "");
+}
+
+std::string dense_gemm_region_name(const compiler::DenseGemmShape &shape) {
+  return "gemm-m" + std::to_string(shape.bm) + "n" + std::to_string(shape.bn) +
+         "k" + std::to_string(shape.bk);
+}
+
 #if SONICBOOM_USE_CUDA
 
 struct LoadedKernel {
@@ -197,30 +228,6 @@ std::string region_ptx(compiler::GlueRegionKind kind, int arch) {
   return std::move(*generated);
 }
 
-bool use_disk_cache() {
-  // SONICBOOM_GLUE_CACHE=0 bypasses the disk cache (read and write): the
-  // ablation for "is this the cached kernel or the one this compiler builds".
-  static const bool use = [] {
-    const char *e = std::getenv("SONICBOOM_GLUE_CACHE");
-    return !(e != nullptr && std::string_view(e) == "0");
-  }();
-  return use;
-}
-
-std::string attention_region_name(const compiler::AttentionShape &shape) {
-  const std::string mask = shape.window_mask ? "-window" : "-causal";
-  if (shape.decode)
-    return "attn-dec-d" + std::to_string(shape.head_dim) + "-g" +
-           std::to_string(shape.gqa) + mask;
-  return "attn-d" + std::to_string(shape.head_dim) + "-g" +
-         std::to_string(shape.gqa) + mask + "-b" + std::to_string(shape.br) +
-         "x" + std::to_string(shape.bc) + "-dps" + std::to_string(shape.dps) +
-         (shape.warp_head ? "-wh" : "") +
-         (shape.async_stages >= 2 ? "-as" + std::to_string(shape.async_stages)
-                                  : "") +
-         (shape.exp2 ? "-x2" : "");
-}
-
 // The generated attention kernel's PTX: disk cache first, generator on a miss.
 // Same entry format and trust model as region_ptx.
 std::string attention_ptx(const compiler::AttentionShape &shape, int arch) {
@@ -245,11 +252,6 @@ std::string attention_ptx(const compiler::AttentionShape &shape, int arch) {
 }
 
 const char *cu_error(CUresult r);
-
-std::string dense_gemm_region_name(const compiler::DenseGemmShape &shape) {
-  return "gemm-m" + std::to_string(shape.bm) + "n" + std::to_string(shape.bn) +
-         "k" + std::to_string(shape.bk);
-}
 
 // The generated dense GEMM's PTX: disk cache first, generator on a miss. Same
 // entry format and trust model as region_ptx.
@@ -391,13 +393,16 @@ bool load_attention(const compiler::AttentionShape &shape,
 
 #elif SONICBOOM_USE_ROCM
 
-// HIP twin of the CUDA block above. The glue-region kernels are compiled by the
-// AMDGPU backend (compiler::generate_glue_hsaco) into an HSA code object
-// (HSACO), cached on disk exactly like the PTX, loaded with hipModuleLoadData
-// and launched with hipModuleLaunchKernel on the HIP current stream.
+// HIP twin of the CUDA block above. The glue-region, attention and GEMM
+// kernels are compiled by the AMDGPU backend (compiler::generate_*_hsaco) into
+// an HSA code object (HSACO), cached on disk exactly like the PTX, loaded with
+// hipModuleLoadData and launched with hipModuleLaunchKernel on the HIP current
+// stream.
 struct LoadedKernel {
   hipModule_t module = nullptr;
   hipFunction_t function = nullptr;
+  // Second entry of a decode module (fa_combine); null for prefill kernels.
+  hipFunction_t function2 = nullptr;
 };
 
 std::unordered_map<std::string, LoadedKernel> &kernel_cache() {
@@ -475,6 +480,72 @@ bool load(std::string_view region, LoadedKernel &out) {
                            compiler::glue_kernel_entry(*kind)) != hipSuccess) {
     std::fprintf(stderr, "glue JIT: hipModuleGetFunction failed for '%.*s'\n",
                  int(region.size()), region.data());
+    (void)hipModuleUnload(out.module);
+    out = {};
+    return false;
+  }
+  return true;
+}
+
+// The generated attention kernel's HSACO: disk cache first, generator on a
+// miss. Same entry format and trust model as region_hsaco.
+std::string attention_hsaco(const compiler::AttentionShape &shape, int arch) {
+  if (arch <= 0 || !compiler::attention_shape_supported(shape)) return {};
+  const std::string region = attention_region_name(shape);
+  const std::string codegen = compiler::attention_codegen_version();
+  const std::filesystem::path path = cache_path(region, arch);
+  if (use_disk_cache()) {
+    const std::string cached = read_file(path);
+    if (!cached.empty()) {
+      std::string body = validate_entry(cached, region, arch, codegen);
+      if (!body.empty()) return body;
+      std::fprintf(stderr, "glue JIT: ignoring stale HSACO cache entry %s\n",
+                   path.c_str());
+    }
+  }
+  auto generated = compiler::generate_attention_hsaco(shape, arch);
+  if (!generated) return {};
+  if (use_disk_cache())
+    write_file(path, make_entry(region, arch, codegen, *generated));
+  return std::move(*generated);
+}
+
+bool load_attention(const compiler::AttentionShape &shape,
+                    std::string_view key, int shared_bytes,
+                    LoadedKernel &out) {
+  // Unlike the CUDA path there is no per-function dynamic shared-memory limit
+  // to raise: gfx11 workgroups get their full 64 KiB of LDS by default (the
+  // generator rejects shapes that ask for more).
+  (void)shared_bytes;
+  const int arch = gfx_arch();
+  const std::string hsaco = attention_hsaco(shape, arch);
+  if (hsaco.empty()) {
+    std::fprintf(stderr, "glue JIT: no generated attention HSACO for '%.*s'\n",
+                 int(key.size()), key.data());
+    return false;
+  }
+  if (hipModuleLoadData(&out.module, hsaco.data()) != hipSuccess) {
+    std::fprintf(stderr,
+                 "glue JIT: hipModuleLoadData failed for '%.*s': %s\n",
+                 int(key.size()), key.data(),
+                 hipGetErrorString(hipGetLastError()));
+    return false;
+  }
+  hipError_t r;
+  if (shape.decode) {
+    r = hipModuleGetFunction(&out.function, out.module,
+                             compiler::kAttentionDecodeKernelEntry);
+    if (r == hipSuccess)
+      r = hipModuleGetFunction(&out.function2, out.module,
+                               compiler::kAttentionCombineKernelEntry);
+  } else {
+    r = hipModuleGetFunction(&out.function, out.module,
+                             compiler::kAttentionKernelEntry);
+  }
+  if (r != hipSuccess) {
+    std::fprintf(stderr,
+                 "glue JIT: hipModuleGetFunction failed for '%.*s': %s\n",
+                 int(key.size()), key.data(), hipGetErrorString(r));
     (void)hipModuleUnload(out.module);
     out = {};
     return false;
@@ -617,6 +688,41 @@ bool launch_attention(const compiler::AttentionShape &shape,
     return false;
   }
   return true;
+#elif SONICBOOM_USE_ROCM
+  if (grid_x <= 0 || grid_y <= 0) return false;
+  const int threads = compiler::attention_block_threads(shape);
+  const int shared_bytes = compiler::attention_shared_bytes(shape);
+  const std::string key = attention_region_name(shape);
+  hipFunction_t function = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex());
+    auto &cache = kernel_cache();
+    auto it = cache.find(key);
+    if (it == cache.end()) {
+      LoadedKernel loaded;
+      if (!load_attention(shape, key, shared_bytes, loaded)) return false;
+      it = cache.emplace(key, loaded).first;
+    }
+    function = it->second.function;
+  }
+  if (function == nullptr) return false;
+
+  if (auto *rec = sonicboom::planner::recorder()) {
+    rec->add_launch(key, "", unsigned(grid_x), unsigned(grid_y), 1,
+                    unsigned(threads), 1, 1, static_cast<uint64_t>(shared_bytes),
+                    reinterpret_cast<const void *>(
+                        sonicboom::hip::sb_current_stream()));
+  }
+  const hipError_t r = hipModuleLaunchKernel(
+      function, unsigned(grid_x), unsigned(grid_y), 1, unsigned(threads), 1, 1,
+      static_cast<unsigned>(shared_bytes), sonicboom::hip::sb_current_stream(),
+      const_cast<void **>(args), nullptr);
+  if (r != hipSuccess) {
+    std::fprintf(stderr, "glue JIT: hipModuleLaunchKernel failed for '%s': %s\n",
+                 key.c_str(), hipGetErrorString(r));
+    return false;
+  }
+  return true;
 #else
   (void)shape;
   (void)args;
@@ -680,6 +786,62 @@ bool launch_attention_decode(const compiler::AttentionShape &shape,
   if (r != CUDA_SUCCESS) {
     std::fprintf(stderr, "glue JIT: cuLaunchKernel failed for '%s': %s\n",
                  key.c_str(), cu_error(r));
+    return false;
+  }
+  return true;
+#elif SONICBOOM_USE_ROCM
+  if (n_chunks <= 0 || n_heads_q <= 0) return false;
+  const int shared_bytes = compiler::attention_shared_bytes(shape);
+  const std::string key = attention_region_name(shape);
+  hipFunction_t partial_fn = nullptr;
+  hipFunction_t combine_fn = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex());
+    auto &cache = kernel_cache();
+    auto it = cache.find(key);
+    if (it == cache.end()) {
+      LoadedKernel loaded;
+      if (!load_attention(shape, key, shared_bytes, loaded)) return false;
+      it = cache.emplace(key, loaded).first;
+    }
+    partial_fn = it->second.function;
+    combine_fn = it->second.function2;
+  }
+  if (partial_fn == nullptr || combine_fn == nullptr) return false;
+
+  // fa_decode: q, kc, vc, startp, nslots, nhq, nhkv, window, scale, part,
+  // chunk. args[11] is out and args[12] the chunk count for fa_combine.
+  void *part_args[11];
+  for (int i = 0; i < 11; ++i) part_args[i] = args[i];
+  void *comb_args[4] = {args[9], args[11], args[5], args[12]};
+
+  if (auto *rec = sonicboom::planner::recorder()) {
+    rec->add_launch(key + ":decode", "", unsigned(n_chunks),
+                    unsigned(n_heads_q), 1, 32, 1, 1,
+                    static_cast<uint64_t>(shared_bytes),
+                    reinterpret_cast<const void *>(
+                        sonicboom::hip::sb_current_stream()));
+    rec->add_launch(key + ":combine", "", unsigned(n_heads_q), 1, 1,
+                    unsigned(shape.head_dim), 1, 1, 0,
+                    reinterpret_cast<const void *>(
+                        sonicboom::hip::sb_current_stream()));
+  }
+  hipError_t r = hipModuleLaunchKernel(
+      partial_fn, unsigned(n_chunks), unsigned(n_heads_q), 1, 32, 1, 1,
+      static_cast<unsigned>(shared_bytes), sonicboom::hip::sb_current_stream(),
+      part_args, nullptr);
+  if (r != hipSuccess) {
+    std::fprintf(stderr, "glue JIT: hipModuleLaunchKernel failed for '%s': %s\n",
+                 key.c_str(), hipGetErrorString(r));
+    return false;
+  }
+  r = hipModuleLaunchKernel(combine_fn, unsigned(n_heads_q), 1, 1,
+                            unsigned(shape.head_dim), 1, 1, 0,
+                            sonicboom::hip::sb_current_stream(), comb_args,
+                            nullptr);
+  if (r != hipSuccess) {
+    std::fprintf(stderr, "glue JIT: hipModuleLaunchKernel failed for '%s': %s\n",
+                 key.c_str(), hipGetErrorString(r));
     return false;
   }
   return true;

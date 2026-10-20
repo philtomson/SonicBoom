@@ -161,6 +161,17 @@ constexpr int kAttentionDecodeMaxChunk = 256;
 std::optional<std::string> generate_attention_ptx(const AttentionShape &shape,
                                                   int sm_arch);
 
+// Emit and lower the kernel for `shape` as an HSA code object (HSACO) for the
+// AMDGPU chip `gfx_arch` (1151 = gfx1151). The ROCm twin of
+// generate_attention_ptx: the same emitted kernel text is retargeted to ROCDL
+// (wave32, with each kernel's block size declared) and serialized by the
+// AMDGPU backend. A shape whose staging exceeds the device's 64 KiB LDS has no
+// AMDGPU kernel and returns nullopt, as does any shape or lowering failure
+// (the MLIR diagnostic is printed). Only meaningful on a ROCm build; on a
+// CUDA-only build it returns nullopt.
+std::optional<std::string> generate_attention_hsaco(const AttentionShape &shape,
+                                                    int gfx_arch);
+
 // The identity of the generator, stamped into the JIT disk cache entry (same
 // contract as glue_codegen_version).
 std::string attention_codegen_version();

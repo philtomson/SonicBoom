@@ -1545,15 +1545,13 @@ std::string region_text(GlueRegionKind kind, int arch, bool amdgpu) {
   if (text == nullptr) return {};
 
   // The module header carries the target attribute with the chip placeholder
-  // (`%CHIP%`). For the AMDGPU path we must swap the NVVM target for the ROCDL
-  // target and request wave32 (the glue kernels' shuffle/reduction trees are
-  // hard-coded to 32 lanes).
-  const std::string chip = amdgpu ? "gfx" + std::to_string(arch)
-                                  : "sm_" + std::to_string(arch);
+  // (`%CHIP%`). Substitute the chip here; the AMDGPU path then hands the NVVM
+  // text to amdgpu_adapt_module_text, which swaps that attribute for the ROCDL
+  // target and declares each kernel's block size (the glue kernels'
+  // shuffle/reduction trees are hard-coded to 32 lanes, hence wave32).
+  const std::string chip = "sm_" + std::to_string(arch);
   const std::string from_attr = "#nvvm.target<chip = \"%CHIP%\">";
-  const std::string to_attr =
-      amdgpu ? "#rocdl.target<chip = \"" + chip + "\", flags = {no_wave64}>"
-             : "#nvvm.target<chip = \"" + chip + "\">";
+  const std::string to_attr = "#nvvm.target<chip = \"" + chip + "\">";
 
   std::string out;
   out.reserve(std::char_traits<char>::length(text) + chip.size() + 16);
@@ -1571,31 +1569,10 @@ std::string region_text(GlueRegionKind kind, int arch, bool amdgpu) {
     pos = at + attr.size();
   }
   if (!amdgpu) return out;
-  // Declare each kernel's block size on its gpu.func. The ROCDL LLVM IR
-  // translation otherwise stamps every kernel `llvm.func` with
-  // `amdgpu-flat-work-group-size = "1,256"`, which rejects the 1024-thread
-  // launch of the decode region ("Launch params ... larger than launch bounds").
-  // lower_gpu_module_to_hsaco turns this attribute into the work-group size
-  // the loader checks.
-  const std::string block =
-      " attributes {gpu.known_block_size = array<i32: " +
-      std::to_string(glue_region_block_threads(kind)) + ", 1, 1>}";
-  std::string sized;
-  sized.reserve(out.size() + 64);
-  std::size_t at = 0;
-  while (true) {
-    const std::size_t hit = out.find(") kernel {", at);
-    if (hit == std::string::npos) {
-      sized.append(out, at, std::string::npos);
-      break;
-    }
-    sized.append(out, at, hit - at + 2);  // through the ')'
-    sized.append("kernel");
-    sized.append(block);
-    sized.append(" {");
-    at = hit + 10;
-  }
-  return amdgpu_rewrite_nvvm(sized);
+  const AmdKernelBlock block{glue_kernel_entry(kind),
+                             glue_region_block_threads(kind)};
+  return amdgpu_adapt_module_text(out, arch,
+                                  std::span<const AmdKernelBlock>(&block, 1));
 }
 
 // The NVPTX target's serialization (gpu.module -> binary with the assembly
@@ -1652,6 +1629,40 @@ void register_nvptx_target() {
 }
 
 } // namespace
+
+std::string amdgpu_adapt_module_text(std::string_view mlir_text, int gfx_arch,
+                                     std::span<const AmdKernelBlock> kernels) {
+  std::string out(mlir_text);
+  // The module header's target attribute is NVVM's; replace that one attribute
+  // (the emitters write it on a single line, with no `>` inside it) with the
+  // ROCDL target for the chip and wave32. `no_wave64` matters because every
+  // generated kernel's shuffle/reduction tree is hard-coded to 32 lanes.
+  const std::string_view from = "#nvvm.target<";
+  const std::size_t at = out.find(from);
+  if (at != std::string::npos) {
+    const std::size_t end = out.find('>', at);
+    if (end != std::string::npos)
+      out.replace(at, end - at + 1,
+                  "#rocdl.target<chip = \"gfx" + std::to_string(gfx_arch) +
+                      "\", flags = {no_wave64}>");
+  }
+  // The kernel body is unchanged by the retargeting, but the launch bound is
+  // not: declare each listed kernel's block size on its gpu.func (see the
+  // launch-bound note in lower_gpu_module_to_hsaco). The emitters close every
+  // kernel signature with `) kernel {`; replace that trailer rather than
+  // inserting before it.
+  for (const AmdKernelBlock &kernel : kernels) {
+    const std::size_t func =
+        out.find("gpu.func @" + std::string(kernel.name) + "(");
+    if (func == std::string::npos) continue;
+    const std::size_t hit = out.find(") kernel {", func);
+    if (hit == std::string::npos) continue;
+    out.replace(hit + 1, 9,
+                " kernel attributes {gpu.known_block_size = array<i32: " +
+                    std::to_string(kernel.threads) + ", 1, 1>} {");
+  }
+  return amdgpu_rewrite_nvvm(out);
+}
 
 std::optional<GlueRegionKind> glue_region_kind_from_name(
     std::string_view name) {

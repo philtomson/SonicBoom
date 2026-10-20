@@ -1,7 +1,9 @@
 # ROCm / Strix Halo Porting Plan
 
 Status: **active** — Phase 0-2 complete (branch `amd_dev`), Phase 4 started
-(vendor-neutral device gate landed), Phase 3 open. `origin/master` merged in
+(vendor-neutral device gate landed), Phase 3 started (generated decode
+attention runs on AMD; prefill attention and the dense GEMM are open).
+`origin/master` merged in
 (bb8e43f): upstream's training/backward work is CUDA-gated in its host files,
 so the ROCm build takes it as host-only code; two conflicts (NVTX include,
 test registration) and one device-path fix in `training/param.cpp`.
@@ -138,9 +140,9 @@ Target GPU: **AMD Radeon 8060S** (Strix Halo iGPU), **gfx1151** (RDNA 3.5,
       CPU-core regression tests (`test_nn`, `test_dequant`, `test_tensor`,
       `test_backend`, `test_quantized_matmul`) still pass.
 - [x] **Full C++ suite on the ROCm build:** `ctest -E guile` = **74/74 pass**
-      (5 expected SKIPs for absent model fixtures). The Guile tests need the
-      `(json)` module — `guile-json` is **not** packaged in Fedora, so it was
-      built from source
+      (5 expected SKIPs for absent model fixtures; 1 failure until the Guile
+      prerequisite below is met). The Guile tests need the `(json)` module —
+      `guile-json` is **not** packaged in Fedora, so it was built from source
       (`https://download.savannah.gnu.org/releases/guile-json/guile-json-4.7.3.tar.gz`,
       `./configure --prefix=$HOME/.local && make && make install`) and the
       Guile tests run with `GUILE_LOAD_PATH=$HOME/.local/share/guile/site/3.0`.
@@ -192,8 +194,35 @@ skips when no AMD device is present).
       last bit behind). Tightening this is a follow-up, not a blocker.
 
 ### Phase 3 — Attention + dense GEMM (functional first)
-- [ ] Emit non-tensor-core thread-partitioned AMD kernels for
-      `nvgpu.ldmatrix`/`nvgpu.mma.sync`/`nvvm.cp.async` regions.
+- [x] **Generated decode attention (the `fa_decode`/`fa_combine` pair) runs on
+      AMD.** The decode kernels are target-neutral (32-lane `gpu.shuffle`,
+      `gpu.barrier`, `math.exp`, f32 fma), so the same text retargets cleanly:
+      `amdgpu_adapt_module_text` (compiler/GlueCodegen) swaps the NVVM target
+      for `#rocdl.target<chip="gfx1151", flags={no_wave64}>`, declares each
+      `gpu.func`'s block size (`fa_decode` 32, `fa_combine` head_dim) and
+      applies the `nvvm.*` rewrites; `generate_attention_hsaco` lowers it
+      through the shared ROCDL pipeline, and `glue_jit` caches/loads/launches
+      the HSACO (`hipModuleLaunchKernel`, same geometry). The glue regions now
+      share that one retargeting helper.
+      `tests/core/test_hip_attention_decode_codegen.cpp` runs the real
+      `nn::cuda::decode_attention_dev` entry with `SONICBOOM_ATTN_DECODE=codegen`
+      over d64/d256/d512 (short context, full window, slot wrap-around,
+      GQA 7): within fp64 tolerance, not worse than the hand-written split-KV,
+      deterministic, and **bit-identical to it at the default chunk** — so the
+      generated pair is the default on AMD too, as on CUDA. Full suite 75/75.
+      It is also faster here (ad-hoc hipEvent probe, 300 iters, gfx1151):
+      d256/512 keys 15.3 us/call vs 47.3 for the hand-written split-KV;
+      d512/1024 keys 26.1 vs 107.9. The hand-written pair's blocks share a KV
+      group across query heads but expose far fewer blocks; on the 40-CU iGPU
+      the generated one-warp-per-(head, chunk) grid wins.
+- [ ] Prefill `fa` on AMD: the emitted body is tensor-core (`nvgpu.ldmatrix` /
+      `nvgpu.mma.sync` / `nvvm.cp.async`, f16 staging). Emit a non-tensor-core
+      thread-partitioned variant (scalar f32 fma loops, no ldmatrix/mma/cp.async)
+      for `generate_attention_hsaco`; the HIP prefill caller
+      (`nn/hip_elementwise.hip:3606`) stays on the hand-written tiled kernel
+      until its numerics/perf justify switching.
+- [ ] Dense bf16 GEMM on AMD: same treatment for `GemmCodegen` (the CUDA body
+      is mma/cp.async); `launch_dense_gemm` still returns false on ROCm.
 - [ ] Optimize later: `MFMA` (fp16 `MFMA_F32_16x16x16_F16`),
       `ds_read_b64`, `s_waitcnt`/bulk prefetch (follow-up).
 

@@ -57,9 +57,9 @@ bool launch(std::string_view region, void* const* args, int blocks, int threads,
 // query head); the block geometry comes from the shape class. The first launch
 // compiles and caches the PTX exactly like a glue region; false means the
 // shape has no generator or the compile/load failed, and the caller falls back
-// to the hand-written kernel.
-// CUDA only for now: on a ROCm build it returns false and the caller falls
-// back to the hand-written kernel.
+// to the hand-written kernel. Emitted for both backends; the HIP prefill
+// caller is still switched to the hand-written kernel, so this is only used on
+// ROCm by tests for now.
 bool launch_attention(const compiler::AttentionShape &shape, void* const* args,
                       int grid_x, int grid_y);
 
@@ -71,8 +71,9 @@ bool launch_attention(const compiler::AttentionShape &shape, void* const* args,
 // block; the combine kernel with grid (n_heads_q) and head_dim threads. The
 // partial buffer is [n_chunks][n_heads_q][head_dim + 2] f32 and must be
 // device-resident before capture (warmed by the first launch). False means
-// the shape has no generator or the compile/load failed.
-// CUDA only for now: on a ROCm build it returns false.
+// the shape has no generator or the compile/load failed. The kernels are
+// emitted for both backends; on ROCm the pair is launched as HSACOs with the
+// same geometry (wave32, so the 32-lane shuffle trees hold).
 bool launch_attention_decode(const compiler::AttentionShape &shape,
                              void* const* args, int n_chunks, int n_heads_q);
 

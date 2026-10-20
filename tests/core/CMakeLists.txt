@@ -385,6 +385,24 @@ if(SONICBOOM_USE_ROCM)
   target_compile_definitions(test_glue_hsaco PRIVATE SONICBOOM_USE_ROCM=1)
   sb_add_cpp_test(test_glue_hsaco)
   set_tests_properties(test_glue_hsaco PROPERTIES RESOURCE_LOCK gpu_vram)
+
+  # The generated flash-decoding pair on the ROCm backend: the decode kernels
+  # (target-neutral: 32-lane shuffles, a barrier, math.exp) are retargeted to
+  # ROCDL, loaded as an HSACO and launched by glue_jit. Checks the numerics
+  # against an fp64 reference and bit-identity with the hand-written split-KV.
+  add_executable(test_hip_attention_decode_codegen
+                 test_hip_attention_decode_codegen.cpp)
+  target_link_libraries(test_hip_attention_decode_codegen
+                        PRIVATE sonicboom sonicboom_compiler hip::host
+                                MLIRBuiltinToLLVMIRTranslation
+                                MLIRLLVMToLLVMIRTranslation)
+  target_link_options(test_hip_attention_decode_codegen
+                      PRIVATE "-Wl,--exclude-libs,ALL")
+  target_compile_definitions(test_hip_attention_decode_codegen
+                             PRIVATE SONICBOOM_USE_ROCM=1)
+  sb_add_cpp_test(test_hip_attention_decode_codegen)
+  set_tests_properties(test_hip_attention_decode_codegen
+    PROPERTIES RESOURCE_LOCK gpu_vram)
 endif()
 
 # Static execution planner tests (unit + integration). They include only

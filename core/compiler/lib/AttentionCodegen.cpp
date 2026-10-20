@@ -51,7 +51,9 @@
 
 #include <llvm/Config/llvm-config.h>
 
+#include <cstdio>
 #include <map>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -1668,6 +1670,45 @@ std::optional<std::string> generate_attention_ptx(const AttentionShape &shape,
   // The softmax exp is libdevice's __nv_expf (math.exp -> nvvm); the opt-in
   // exp2 arm uses __nv_exp2f instead.
   return lower_gpu_module_to_ptx(text, /*link_libdevice=*/true, "attention");
+}
+
+namespace {
+// gfx11 (RDNA3/3.5) workgroups get 64 KiB of LDS; the prefill staging can ask
+// for more (the generator allows up to 96 KiB for NVIDIA).
+constexpr int kAmdGfx11LdsBytes = 64 * 1024;
+} // namespace
+
+std::optional<std::string> generate_attention_hsaco(const AttentionShape &shape,
+                                                    int gfx_arch) {
+  if (!attention_shape_supported(shape) || gfx_arch <= 0) return std::nullopt;
+  const int shared_bytes = attention_shared_bytes(shape);
+  if (shared_bytes > kAmdGfx11LdsBytes) {
+    std::fprintf(stderr,
+                 "attention codegen: gfx%d has %d B of LDS, the shape needs "
+                 "%d B\n",
+                 gfx_arch, kAmdGfx11LdsBytes, shared_bytes);
+    return std::nullopt;
+  }
+  // The emitters write the chip into an NVVM target attribute; the retargeting
+  // replaces that attribute wholesale, so the value here is not used.
+  if (shape.decode) {
+    const std::string text = attention_decode_region_text(shape, gfx_arch);
+    const AmdKernelBlock blocks[] = {
+        {kAttentionDecodeKernelEntry, attention_block_threads(shape)},
+        {kAttentionCombineKernelEntry, shape.head_dim}};
+    const std::string adapted =
+        amdgpu_adapt_module_text(text, gfx_arch, blocks);
+    return lower_gpu_module_to_hsaco(adapted, /*link_libdevice=*/true,
+                                     "attention");
+  }
+  const std::string text = attention_region_text(shape, gfx_arch);
+  const AmdKernelBlock block{kAttentionKernelEntry,
+                             attention_block_threads(shape)};
+  const std::string adapted =
+      amdgpu_adapt_module_text(text, gfx_arch,
+                               std::span<const AmdKernelBlock>(&block, 1));
+  return lower_gpu_module_to_hsaco(adapted, /*link_libdevice=*/true,
+                                   "attention");
 }
 
 std::string attention_codegen_version() {
