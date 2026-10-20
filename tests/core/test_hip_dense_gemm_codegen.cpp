@@ -1,11 +1,12 @@
 // Compiler-generated dense bf16 GEMM on the ROCm backend (Phase 3).
 //
 // planner::glue::launch_dense_gemm's CUDA path runs the generated tensor-core
-// kernel (nvgpu ldmatrix/mma, cp.async). That body has no ROCDL lowering, so
-// the AMD path emits compiler/GemmCodegen.cpp's scalar body instead: one BK
-// slab per K step staged in shared memory, then a 4 x (outputs/thread/4)
-// register tile per thread with 8-wide bf16 vector loads and f32 reductions.
-// Same kernel ABI, same Y[token][row] output contract, same scale epilogue.
+// kernel (nvgpu ldmatrix/mma, cp.async). Those ops have no ROCDL lowering (and
+// RDNA has no MFMA), so the AMD path emits compiler/GemmCodegen.cpp's WMMA
+// body instead: one BK slab per K step staged in shared memory, then a
+// 16x16x16 bf16 -> f32 footprint per wave32 wavefront, one whole tile per warp
+// slot. Same kernel ABI, same Y[token][row] output contract, same scale
+// epilogue.
 //
 // This checks that HSACO end to end: the fp64 reference over the same
 // bf16-rounded operands bounds the error, the rocBLAS GemmEx path is the
@@ -15,8 +16,8 @@
 // planner relies on to drop the fixed 128-column blocking).
 //
 // Shapes: a full 64x64x64 tile, a tail shape where M/K/N all miss the tile
-// multiples, a 128x128x64 tile (16-token register tiles) and a 128x32x32 tile
-// (two-token register tiles).
+// multiples, then every autotune candidate tile -- the tuner JITs all of them
+// on a cold shape class, and they span 1..8 WMMA tiles per warp.
 //
 // Skips cleanly (exit 0) when no HIP device is present.
 

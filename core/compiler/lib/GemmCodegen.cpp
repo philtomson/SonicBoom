@@ -44,10 +44,9 @@
 namespace sonicboom::compiler {
 namespace {
 
-// The AMDGPU body's fixed block (see gemm_region_text_amd): the scalar kernel
-// derives its per-thread register tile from this, so the launcher and the
-// emitter must agree on it.
-constexpr int kAmdDenseGemmThreads = 256;
+// The AMDGPU body stages a shared slab whose rows are padded to this many
+// elements: 32 bytes, the width of one WMMA fragment read.
+constexpr int kAmdWmmaPad = 16;
 
 // gfx11 gives a workgroup 64 KiB of LDS; the AMD body stages one slab per K
 // step and rejects shapes whose slab does not fit.
@@ -384,28 +383,43 @@ std::string gemm_region_text(const DenseGemmShape &sh, int sm_arch) {
 }
 
 // AMDGPU body. The tensor-core text above is NVVM-only (nvgpu ldmatrix/mma,
-// cp.async), so this keeps the same kernel ABI and the same output contract
-// with tensor-neutral ops: one BK slab of W and X per K step is cooperatively
-// staged in shared memory (scalar loads, zero fill out of range), then every
-// thread accumulates its 4 x (outputs/thread/4) register tile out of that slab
-// with 8-wide bf16 vector loads, an extf to f32 and `vector.reduction <add>`.
-// Single-buffered: two barriers per step, no async copies.
+// cp.async), so the AMD body targets what gfx11/gfx12 actually have: the
+// ROCDL WMMA intrinsic. RDNA has no MFMA (CDNA-only; llvm-mc rejects
+// `v_mfma_*` for gfx1151), while `v_wmma_f32_16x16x16_bf16` computes a
+// 16x16x16 bf16 -> f32 tile per wave32 wavefront:
+//   A (16x16, M x K): lane L holds A[L % 16][*] -- one row, K in the slots;
+//   B (16x16, K x N): lane L holds B[*][L % 16] -- one column, K in the slots;
+//   D (16x16, M x N): lane L, slot i -> D[2*i + L/16][L % 16].
+// Lanes 16-31 hold the same A and B fragments as lanes 0-15 (matrix
+// replication); their D slots are the odd rows, so a warp produces a whole tile
+// with no cross-lane traffic. Operands are therefore "one K-contiguous row"
+// fragments (X's token row, W's row): no ldmatrix, no transposes.
 //
-// Thread map: 256 threads, `tpr` thread tiles across the token axis, so a warp
-// reads one W row per 4-row group and `tpr`-wide X rows from LDS.
+// The staging is the scalar body's single-buffered BK slab (cooperative scalar
+// loads, zero fill out of range, two barriers per step); each fragment is one
+// 32-byte LDS read. A warp owns TPT whole 16x16 tiles (tile = warp + slot *
+// WARPS) and keeps 8 f32 accumulators per tile across the K loop; the epilogue
+// writes Y[token * M + row] with the same exact `alpha * acc` as the other
+// bodies. Thread count follows the tile count (WARPS below).
 std::string gemm_region_text_amd(const DenseGemmShape &sh, int gfx_arch) {
   const int BM = sh.bm;
   const int BN = sh.bn;
   const int BK = sh.bk;
-  constexpr int kPad = 8;  // elements; pads a row to a 16-byte boundary
+  constexpr int kPad = kAmdWmmaPad;  // elements; 32-byte LDS row alignment
   const int BKW = BK + kPad;
-  const int OUT = BM * BN / kAmdDenseGemmThreads;  // accumulators per thread
-  constexpr int BRT = 4;                           // output rows per thread
-  const int BTT = OUT / BRT;                       // output tokens per thread
-  const int TPR = BN / BTT;                        // thread tiles across tokens
-  const int StagedA = BM * BK;                     // elements per slab
+  const int NV = BKW / 16;           // vector<16xbf16> slots per LDS row
+  const int NT = BN / 16;            // 16-column tiles per row of the block
+  const int TILES = (BM / 16) * (BN / 16);
+  const int WARPS = TILES >= 8 ? 8 : 4;
+  const int THREADS = WARPS * 32;
+  const int TPT = TILES / WARPS;     // whole tiles per warp
+  const int KS = BK / 16;            // 16-K WMMA steps per staged slab
+  constexpr int BRT = 16;            // rows of a WMMA tile
+  constexpr int BCT = 16;            // columns of a WMMA tile
+  constexpr int ACC = 8;             // f32 accumulators per tile per lane
+  const int StagedA = BM * BK;
   const int StagedB = BN * BK;
-  const int BStage = BM * BKW * 2;                 // bytes; B starts after A
+  const int BStage = BM * BKW * 2;   // bytes; B starts after A
   const std::string SmemTy = "#gpu.address_space<workgroup>";
 
   Emitter e;
@@ -423,24 +437,28 @@ std::string gemm_region_text_amd(const DenseGemmShape &sh, int gfx_arch) {
   const auto ci = [&](const char *n, int v) {
     C[n] = e.val("arith.constant " + s(v) + " : index");
   };
+  const auto cconst = [&](int v) {
+    return e.val("arith.constant " + s(v) + " : index");
+  };
 
   const std::string FUNC =
       "gpu.func @gemm(%x: memref<?x?xbf16>, %w: memref<?x?xbf16>, "
       "%y: !llvm.ptr, %m: i32, %k: i32, %n: i32, %alpha: f32) kernel {";
 
   c32("c0", 0); c32("c1", 1); c32("c2", 2); c32("c8", 8);
+  for (int i = 4; i < 2 * ACC; i += 2) c32(("c" + s(i)).c_str(), i);
   c32("cbm", BM); c32("cbn", BN);
   c64("l0", 0); c64("l1", 1);
-  ci("i0", 0); ci("i1", 1); ci("i8", 8);
-  ci("ith", kAmdDenseGemmThreads);
+  ci("i0", 0); ci("i1", 1); ci("i8", 8); ci("i16", BRT); ci("i32", 32);
+  ci("ith", THREADS);
   ci("ibk", BK);
   ci("ibsoff", BStage);
   ci("icha", StagedA);
   ci("ichb", StagedB);
-  ci("itpr", TPR);
-  ci("ibr", BRT);
-  ci("ibtt", BTT);
+  ci("int", NT);
+  ci("itpt", TPT);
   cf("cf0", "0.0");
+  C["czero"] = e.val("arith.constant dense<0.0> : vector<8xf32>");
 
   const std::string tid = e.val("gpu.thread_id x");
   const std::string bx = e.val("gpu.block_id x");
@@ -455,18 +473,19 @@ std::string gemm_region_text_amd(const DenseGemmShape &sh, int gfx_arch) {
       e.val("memref.view " + smem + "[" + C["ibsoff"] +
             "][] : memref<?xi8, " + SmemTy + "> to memref<" + s(BN) + "x" +
             s(BKW) + "xbf16, " + SmemTy + ">");
-  // Readers view the same slabs as 8-wide bf16 vectors: `vector.load` from a
+  // Readers view the same slabs as 16-wide bf16 vectors: `vector.load` from a
   // workgroup memref is not converted by the ROCDL pipeline (it needs the
   // workgroup memory-space mapping that only the GPU conversion registers),
-  // while `memref.load` of a vector element type is.
+  // while `memref.load` of a vector element type is. A WMMA fragment is one
+  // such 32-byte load per lane.
   const std::string asmv =
       e.val("memref.view " + smem + "[" + C["i0"] +
             "][] : memref<?xi8, " + SmemTy + "> to memref<" + s(BM) + "x" +
-            s(BKW / 8) + "xvector<8xbf16>, " + SmemTy + ">");
+            s(NV) + "xvector<16xbf16>, " + SmemTy + ">");
   const std::string bsmv =
       e.val("memref.view " + smem + "[" + C["ibsoff"] +
             "][] : memref<?xi8, " + SmemTy + "> to memref<" + s(BN) + "x" +
-            s(BKW / 8) + "xvector<8xbf16>, " + SmemTy + ">");
+            s(NV) + "xvector<16xbf16>, " + SmemTy + ">");
   const std::string bxi = e.val("arith.index_cast " + bx + " : index to i32");
   const std::string byi = e.val("arith.index_cast " + by + " : index to i32");
   const std::string n0 = e.val("arith.muli " + bxi + ", " + C["cbn"] +
@@ -477,15 +496,45 @@ std::string gemm_region_text_amd(const DenseGemmShape &sh, int gfx_arch) {
   const std::string ktmax =
       e.val("arith.ceildivui " + kidx + ", " + C["ibk"] + " : index");
 
-  // Tile origins: thread -> (row group, token group), block -> (m0, n0).
-  const std::string rowtile =
-      e.val("arith.divui " + tid + ", " + C["itpr"] + " : index");
-  const std::string toktile =
-      e.val("arith.remui " + tid + ", " + C["itpr"] + " : index");
-  const std::string row0 =
-      e.val("arith.muli " + rowtile + ", " + C["ibr"] + " : index");
-  const std::string tok0 =
-      e.val("arith.muli " + toktile + ", " + C["ibtt"] + " : index");
+  // Wave coordinates: a warp owns whole 16x16 tiles; lane % 16 picks the tile
+  // row (A) / tile column (B) and lane / 16 picks the odd accumulator rows.
+  const std::string warp = e.val("arith.divui " + tid + ", " + C["i32"] +
+                                 " : index");
+  const std::string lane = e.val("arith.remui " + tid + ", " + C["i32"] +
+                                 " : index");
+  const std::string l16 = e.val("arith.remui " + lane + ", " + C["i16"] +
+                                " : index");
+  const std::string hi = e.val("arith.divui " + lane + ", " + C["i16"] +
+                               " : index");
+  const std::string hi32 = e.val("arith.index_cast " + hi + " : index to i32");
+  const std::string l32 = e.val("arith.index_cast " + l16 + " : index to i32");
+
+  std::vector<std::string> arow(TPT), brow(TPT), mrow(TPT), tcol(TPT);
+  std::vector<std::string> mbase(TPT), nbase(TPT);
+  for (int ti = 0; ti < TPT; ++ti) {
+    const std::string off = cconst(ti * WARPS);
+    const std::string t =
+        ti == 0 && WARPS == 1 ? warp
+                              : e.val("arith.addi " + warp + ", " + off +
+                                      " : index");
+    const std::string mi = e.val("arith.divui " + t + ", " + C["int"] +
+                                " : index");
+    const std::string ni = e.val("arith.remui " + t + ", " + C["int"] +
+                                " : index");
+    const std::string mi16 = e.val("arith.muli " + mi + ", " + C["i16"] +
+                                   " : index");
+    const std::string ni16 = e.val("arith.muli " + ni + ", " + C["i16"] +
+                                   " : index");
+    arow[ti] = e.val("arith.addi " + mi16 + ", " + l16 + " : index");
+    brow[ti] = e.val("arith.addi " + ni16 + ", " + l16 + " : index");
+    const std::string mi32 = e.val("arith.index_cast " + mi16 +
+                                   " : index to i32");
+    const std::string ni32 = e.val("arith.index_cast " + ni16 +
+                                   " : index to i32");
+    mbase[ti] = e.val("arith.addi " + m0 + ", " + mi32 + " : i32");
+    nbase[ti] = e.val("arith.addi " + n0 + ", " + ni32 + " : i32");
+    tcol[ti] = e.val("arith.addi " + nbase[ti] + ", " + l32 + " : i32");
+  }
 
   // One slab: each thread stages a strided subset of the elements, loading W or
   // X at (row, col) and zero-filling outside the runtime bounds.
@@ -533,11 +582,11 @@ std::string gemm_region_text_amd(const DenseGemmShape &sh, int gfx_arch) {
   };
 
   std::vector<std::string> names;
-  for (int i = 0; i < OUT; ++i) names.push_back("%o" + s(i));
+  for (int i = 0; i < TPT; ++i) names.push_back("%w" + s(i));
   std::string ia = "iter_args(", ty = " -> (", res;
-  for (int i = 0; i < OUT; ++i) {
-    ia += (i ? ", " : "") + names[i] + " = " + C["cf0"];
-    ty += (i ? ", " : "") + std::string("f32");
+  for (int i = 0; i < TPT; ++i) {
+    ia += (i ? ", " : "") + names[i] + " = " + C["czero"];
+    ty += (i ? ", " : "") + std::string("vector<8xf32>");
     res += (i ? ", " : "") + std::string("%g") + s(i);
   }
   ia += ")";
@@ -553,46 +602,31 @@ std::string gemm_region_text_amd(const DenseGemmShape &sh, int gfx_arch) {
     e.op("gpu.barrier");
 
     std::vector<std::string> cur = names;
-    for (int kk = 0; kk < BK; kk += 8) {
-      const std::string kkc =
-          e.val("arith.constant " + s(kk / 8) + " : index");
-      for (int r = 0; r < BRT; ++r) {
-        const std::string ar =
-            r == 0 ? row0
-                   : e.val("arith.addi " + row0 + ", " +
-                           e.val("arith.constant " + s(r) + " : index") +
-                           " : index");
+    for (int ks = 0; ks < KS; ++ks) {
+      const std::string kv = cconst(ks);
+      for (int ti = 0; ti < TPT; ++ti) {
         const std::string av = e.val(
-            "memref.load " + asmv + "[" + ar + ", " + kkc +
-            "] : memref<" + s(BM) + "x" + s(BKW / 8) + "xvector<8xbf16>, " +
+            "memref.load " + asmv + "[" + arow[ti] + ", " + kv +
+            "] : memref<" + s(BM) + "x" + s(NV) + "xvector<16xbf16>, " +
             SmemTy + ">");
-        const std::string af = e.val("arith.extf " + av +
-                                     " : vector<8xbf16> to vector<8xf32>");
-        for (int t = 0; t < BTT; ++t) {
-          const std::string bt =
-              t == 0 ? tok0
-                     : e.val("arith.addi " + tok0 + ", " +
-                             e.val("arith.constant " + s(t) + " : index") +
-                             " : index");
-          const std::string bv = e.val(
-              "memref.load " + bsmv + "[" + bt + ", " + kkc +
-              "] : memref<" + s(BN) + "x" + s(BKW / 8) + "xvector<8xbf16>, " +
-              SmemTy + ">");
-          const std::string bf = e.val("arith.extf " + bv +
-                                       " : vector<8xbf16> to vector<8xf32>");
-          const std::string pr = e.val("arith.mulf " + af + ", " + bf +
-                                       " : vector<8xf32>");
-          const std::string d = e.val("vector.reduction <add>, " + pr +
-                                      " : vector<8xf32> into f32");
-          const int idx = r * BTT + t;
-          cur[idx] = e.val("arith.addf " + cur[idx] + ", " + d + " : f32");
-        }
+        const std::string bv = e.val(
+            "memref.load " + bsmv + "[" + brow[ti] + ", " + kv +
+            "] : memref<" + s(BN) + "x" + s(NV) + "xvector<16xbf16>, " +
+            SmemTy + ">");
+        const std::string ai =
+            e.val("arith.bitcast " + av + " : vector<16xbf16> to vector<16xi16>");
+        const std::string bi =
+            e.val("arith.bitcast " + bv + " : vector<16xbf16> to vector<16xi16>");
+        cur[ti] = e.val(
+            "rocdl.wmma.f32.16x16x16.bf16 " + ai + ", " + bi + ", " + cur[ti] +
+            " : (vector<16xi16>, vector<16xi16>, vector<8xf32>) -> "
+            "vector<8xf32>");
       }
     }
     std::string yields, ytypes;
-    for (int i = 0; i < OUT; ++i) {
+    for (int i = 0; i < TPT; ++i) {
       yields += (i ? ", " : "") + cur[i];
-      ytypes += (i ? ", " : "") + std::string("f32");
+      ytypes += (i ? ", " : "") + std::string("vector<8xf32>");
     }
     e.op("scf.yield " + yields + " : " + ytypes);
   }
@@ -600,38 +634,37 @@ std::string gemm_region_text_amd(const DenseGemmShape &sh, int gfx_arch) {
 
   // ---- store: Y[token][row] (token-major), f32 ----
   const std::string m64 = e.val("arith.extsi %m : i32 to i64");
-  const std::string row0i = e.val("arith.index_cast " + row0 + " : index to i32");
-  const std::string tok0i = e.val("arith.index_cast " + tok0 + " : index to i32");
-  const std::string mrow0 = e.val("arith.addi " + m0 + ", " + row0i + " : i32");
-  const std::string mtok0 = e.val("arith.addi " + n0 + ", " + tok0i + " : i32");
-  for (int r = 0; r < BRT; ++r) {
-    const std::string gmrow =
-        r == 0 ? mrow0
-               : e.val("arith.addi " + mrow0 + ", " +
-                       e.val("arith.constant " + s(r) + " : i32") + " : i32");
-    const std::string mok =
-        e.val("arith.cmpi slt, " + gmrow + ", %m : i32");
-    for (int t = 0; t < BTT; ++t) {
-      const std::string tokc =
-          t == 0 ? mtok0
-                 : e.val("arith.addi " + mtok0 + ", " +
-                         e.val("arith.constant " + s(t) + " : i32") + " : i32");
-      const std::string tok_ok =
-          e.val("arith.cmpi slt, " + tokc + ", %n : i32");
+  for (int ti = 0; ti < TPT; ++ti) {
+    const std::string tok_ok =
+        e.val("arith.cmpi slt, " + tcol[ti] + ", %n : i32");
+    const std::string tok64 =
+        e.val("arith.extsi " + tcol[ti] + " : i32 to i64");
+    const std::string off0 =
+        e.val("arith.muli " + tok64 + ", " + m64 + " : i64");
+    for (int i = 0; i < ACC; ++i) {
+      const int rowoff = 2 * i;
+      std::string mrow_i = mbase[ti];
+      if (rowoff != 0)
+        mrow_i = e.val("arith.addi " + mrow_i + ", " + C["c" + s(rowoff)] +
+                       " : i32");
+      const std::string mrow = e.val("arith.addi " + mrow_i + ", " + hi32 +
+                                     " : i32");
+      const std::string mrow_ok =
+          e.val("arith.cmpi slt, " + mrow + ", %m : i32");
       const std::string ok =
-          e.val("arith.andi " + mok + ", " + tok_ok + " : i1");
+          e.val("arith.andi " + mrow_ok + ", " + tok_ok + " : i1");
       e.op("scf.if " + ok + " {");
-      const std::string tok64 = e.val("arith.extsi " + tokc + " : i32 to i64");
-      const std::string off0 =
-          e.val("arith.muli " + tok64 + ", " + m64 + " : i64");
       const std::string mrow64 =
-          e.val("arith.extsi " + gmrow + " : i32 to i64");
+          e.val("arith.extsi " + mrow + " : i32 to i64");
       const std::string off =
           e.val("arith.addi " + off0 + ", " + mrow64 + " : i64");
       const std::string p = e.val("llvm.getelementptr %y[" + off +
                                   "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+      const std::string av =
+          e.val("vector.extract %g" + s(ti) + "[" + s(i) +
+                "] : f32 from vector<8xf32>");
       const std::string ys =
-          e.val("arith.mulf %g" + s(r * BTT + t) + ", %alpha : f32");
+          e.val("arith.mulf " + av + ", %alpha : f32");
       e.op("llvm.store " + ys + ", " + p + " : f32, !llvm.ptr");
       e.op("}");
     }
@@ -654,13 +687,13 @@ bool dense_gemm_shape_supported(const DenseGemmShape &shape) {
   if (shape.bm % 16 != 0 || shape.bn % 8 != 0 || shape.bk % 16 != 0)
     return false;
 #if defined(SONICBOOM_USE_ROCM)
-  // The AMD body: 256 threads, a 4-row register tile, and one staged slab per
-  // K step. bm*bn/256 must split exactly into 4 x btt tiles across the block.
-  if ((shape.bm * shape.bn) % kAmdDenseGemmThreads != 0) return false;
-  const int out = shape.bm * shape.bn / kAmdDenseGemmThreads;
-  if (out <= 0 || out % 4 != 0) return false;
-  const int btt = out / 4;
-  if (btt <= 0 || btt > 16 || shape.bn % btt != 0) return false;
+  // The AMD body is a grid of 16x16 WMMA tiles, 4 or 8 warps per block (one
+  // whole tile per warp slot, so the tiles must divide evenly) and at most 8
+  // accumulator tiles per lane (64 f32 registers).
+  if (shape.bn % 16 != 0) return false;
+  const int tiles = (shape.bm / 16) * (shape.bn / 16);
+  const int warps = tiles >= 8 ? 8 : 4;
+  if (tiles % warps != 0 || tiles / warps > 8) return false;
   return dense_gemm_shared_bytes(shape) <= kAmdDenseGemmLdsBytes;
 #else
   if (shape.bm / 16 > 8) return false;  // at most 256 threads
@@ -671,10 +704,18 @@ bool dense_gemm_shape_supported(const DenseGemmShape &shape) {
 #endif
 }
 
+#if defined(SONICBOOM_USE_ROCM)
+// AMD: 4 warps for a small tile grid, 8 when there is a tile per warp to fill.
+// One whole 16x16 WMMA tile per warp slot; the emitter uses the same rule.
+static int amd_dense_gemm_threads(const DenseGemmShape &shape) {
+  const int tiles = (shape.bm / 16) * (shape.bn / 16);
+  return (tiles >= 8 ? 8 : 4) * 32;
+}
+#endif
+
 int dense_gemm_block_threads(const DenseGemmShape &shape) {
 #if defined(SONICBOOM_USE_ROCM)
-  (void)shape;  // the scalar body fixes the block; the tile sets its registers
-  return kAmdDenseGemmThreads;
+  return amd_dense_gemm_threads(shape);
 #else
   return (shape.bm / 16) * 32;
 #endif
@@ -683,9 +724,10 @@ int dense_gemm_block_threads(const DenseGemmShape &shape) {
 int dense_gemm_shared_bytes(const DenseGemmShape &shape) {
   const int row = shape.bk + 8;
 #if defined(SONICBOOM_USE_ROCM)
-  // One staged slab each for W and X (see gemm_region_text_amd), rows padded by
-  // 8 elements so the 8-wide vector loads stay 16-byte aligned.
-  return (shape.bm * row + shape.bn * row) * 2;
+  // One staged slab each for W and X (see gemm_region_text_amd), rows padded to
+  // a 32-byte boundary so each WMMA fragment is one aligned LDS read.
+  const int arow = shape.bk + kAmdWmmaPad;
+  return (shape.bm * arow + shape.bn * arow) * 2;
 #else
   // Double-buffered A and B stages, each row padded by 8 elements (see
   // gemm_region_text) so ldmatrix does not read every row from the same bank.
@@ -706,7 +748,7 @@ std::optional<std::string> generate_dense_gemm_hsaco(const DenseGemmShape &shape
   if (gfx_arch <= 0 || !dense_gemm_shape_supported(shape)) return std::nullopt;
   const std::string text = gemm_region_text_amd(shape, gfx_arch);
   const AmdKernelBlock block{kDenseGemmKernelEntry,
-                             dense_gemm_block_threads(shape)};
+                             amd_dense_gemm_threads(shape)};
   const std::string adapted = amdgpu_adapt_module_text(
       text, gfx_arch, std::span<const AmdKernelBlock>(&block, 1));
   return lower_gpu_module_to_hsaco(adapted, /*link_libdevice=*/false,
@@ -720,9 +762,10 @@ std::optional<std::string> generate_dense_gemm_hsaco(const DenseGemmShape &shape
 
 std::string dense_gemm_codegen_version() {
   // gemm2: padded shared staging (conflict-free ldmatrix); gemm3: scalar
-  // scale epilogue (the folded `scale` consumer); gemm4: the AMD scalar body
-  // (the version keys the disk cache for both backends).
-  return std::string("llvm-") + LLVM_VERSION_STRING + "-gemm4";
+  // scale epilogue (the folded `scale` consumer); gemm4: the AMD scalar body;
+  // gemm5: the AMD WMMA body (the version keys the disk cache for both
+  // backends).
+  return std::string("llvm-") + LLVM_VERSION_STRING + "-gemm5";
 }
 
 } // namespace sonicboom::compiler

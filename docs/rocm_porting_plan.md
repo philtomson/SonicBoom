@@ -2,10 +2,10 @@
 
 Status: **functional path complete** (branch `amd_dev`) — Phases 0-4 done: the
 hand-written kernels, the device-resident forward, the planner spine (graph
-capture/replay through the HIP twin) and the generated decode/prefill attention
-and dense bf16 GEMM all run on AMD. What is not closed is verification beyond
-each unit (no GGUF fixture here, so the token-level spine tests skip) and the
-tensor-core optimization (MFMA).
+capture/replay through the HIP twin), the generated decode/prefill attention
+and the generated dense bf16 GEMM (WMMA) all run on AMD. What is not closed is
+verification beyond each unit (no GGUF fixture here, so the token-level spine
+tests skip) and GEMM tuning (the WMMA body is single-buffered and unoptimized).
 `origin/master` merged in
 (bb8e43f): upstream's training/backward work is CUDA-gated in its host files,
 so the ROCm build takes it as host-only code; two conflicts (NVTX include,
@@ -310,8 +310,36 @@ skips when no AMD device is present).
       vector directly. `SONICBOOM_DUMP_HSACO_IR=1` prints the fully converted
       module before serialization; the ROCDL failure itself only shows up as a
       serializer diagnostic.
-- [ ] Optimize later: `MFMA` (fp16 `MFMA_F32_16x16x16_F16`),
-      `ds_read_b64`, `s_waitcnt`/bulk prefetch (follow-up).
+- [x] **Tensor-core body: WMMA, not MFMA.** The planned `MFMA_F32_16x16x16_F16`
+      cannot be used: `v_mfma_*` is CDNA-only and llvm-mc rejects it for
+      gfx1151 ("instruction not supported on this GPU"). What RDNA3.5 does have
+      is `v_wmma_f32_16x16x16_bf16`, and `rocdl.wmma.f32.16x16x16.bf16` is its
+      MLIR op, so `gemm_region_text_amd` now emits a WMMA tile instead of the
+      scalar register tile: one staged BK slab (scalar loads, zero fill, two
+      barriers per step, unchanged), then per warp a whole 16x16 output tile
+      per K step of 16. The layout is the RDNA3 one, and it is why no
+      ldmatrix/transpose is needed: A is row-per-lane (`lane % 16` picks the A
+      row, K in the fragment slots) and B is column-per-lane (`lane % 16` picks
+      the B column, K in the slots) -- i.e. exactly one K-contiguous row of X
+      and one of W, each a single 32-byte LDS read. Lanes 16-31 carry the same
+      input fragments (matrix replication) and own the odd accumulator rows
+      (`D[2*i + lane/16][lane % 16]`), so a warp writes a whole tile with no
+      cross-lane traffic. 4 warps for a small tile grid, 8 when each warp gets
+      a tile (one accumulator tile = 8 f32 registers per lane, capped at 8
+      tiles per lane); the 64 KiB LDS budget still bounds the slab.
+      Measured on gfx1151: a 1024x1024x1024 bf16 GEMM with the 128x128x64 tile
+      runs in 0.55 ms (~3.9 TFLOP/s). The scalar body it replaces was not
+      benchmarked before it was removed, and rocBLAS is not loadable in this
+      process (weak hipBLAS symbols, see below), so the headroom is unmeasured.
+      It is a functional first cut, not a tuned kernel: the remaining items are
+      double buffering / `s_waitcnt`, reusing the A fragment across N tiles,
+      and `ds_read_b64` scheduling.
+      Numerics: relative error vs fp64 stays 3.6e-6..4.1e-6 over all ten
+      autotune tiles and the tail shape, batch invariance is still bitwise, and
+      the scale epilogue is still exact. `dense_gemm_codegen_version` bumps to
+      `gemm5` (the body changed; the disk cache would otherwise serve the
+      scalar HSACO). The test grew to cover the full candidate list, which is
+      what exercises 1..8 WMMA tiles per warp.
 
 ### Phase 4 — Layer-2 hygiene + tests
 - [x] **Vendor-neutral device gate.** `quant::gpu_available()` and
@@ -430,10 +458,11 @@ not of this port:
 - LLVM/MLIR rebuild with AMDGPU is the long pole (hours); submodule not expanded.
 - Attention/GEMM codegen is NVIDIA-mma-specific and stays that way for CUDA;
   the functional AMD bodies are new code, not a flag flip (Phase 3).
-- The AMD bodies are scalar (f32 accumulation, `vector.reduction`); MFMA is the
-  performance follow-up, so generated dense GEMM throughput is well below
-  rocBLAS. gfx1151's 64 KiB LDS is checked at codegen (the dense body rejects
-  tiles that do not fit); attention uses no LDS on AMD.
+- The AMD dense GEMM body uses WMMA (RDNA has no MFMA) but is untuned:
+  single-buffered staging, no A-fragment reuse across N tiles, ~3.9 TFLOP/s on
+  a 1024^3 GEMM (rocBLAS is several times faster, when it is loadable at all).
+  gfx1151's 64 KiB LDS is checked at codegen (the dense body rejects tiles that
+  do not fit); the generated attention bodies use no LDS on AMD.
 - Wave width / shared-memory / async-copy semantics differ; wave32 is pinned
   (see Phase 2).
 - The HIP spine compiles and links but has not been run end-to-end (no model

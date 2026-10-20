@@ -22,13 +22,14 @@
 //
 //   gpu.func + nvgpu.mma.sync / nvgpu.ldmatrix / nvgpu.device_async_copy
 //       -> nvvm -> PTX          (CUDA)
-//   gpu.func + scalar f32 fma + workgroup staging
+//   gpu.func + rocdl.wmma.f32.16x16x16.bf16 + workgroup staging
 //       -> rocdl -> HSACO       (AMDGPU)
 //
-// The AMD body has no tensor-core ops (the ROCDL pipeline does not lower the
-// nvgpu ones): it stages one BK slab per step in shared memory and computes a
-// 4 x (outputs/thread/4) register tile per thread with 8-wide bf16 vector
-// loads and f32 reductions.
+// The AMD body cannot use the nvgpu ops (the ROCDL pipeline does not lower
+// them) and RDNA has no MFMA (`v_mfma_*` is rejected for gfx1151), so it uses
+// the matrix instruction the target does have: one BK slab staged in shared
+// memory, then one 16x16x16 bf16 -> f32 WMMA tile per wave32 wavefront (4 or 8
+// warps per block, one whole tile per warp slot).
 //
 // Operands and result (the strided dense projection's layout):
 //   X  [N][K] bf16, token-major (K contiguous)
@@ -38,8 +39,10 @@
 // C (rows x n) column-major view does.
 //
 // Tiling: one block per (BM output rows x BN tokens). The K loop stages BK
-// elements of both operands with cp.async double buffering, runs
-// m16n8k16 bf16 -> f32 tensor-core mma over (BM/16) warps, and writes f32.
+// elements of both operands and accumulates f32 tiles over it: on CUDA with
+// cp.async double buffering and m16n8k16 bf16 -> f32 tensor-core mma over
+// (BM/16) warps, on AMDGPU with the single-buffered slab above and 16x16x16
+// WMMA tiles. Both write f32.
 //
 // Batch invariance: a block owns a fixed (row, token) tile, the K loop runs in
 // ascending BK steps, and each accumulator sees the same sequence of mma
@@ -68,15 +71,17 @@ struct DenseGemmShape {
   }
 };
 
-// True when the generator covers the shape: bm/16 warps of 32 threads (at most
-// 8 warps, so at most 256 threads), bn/8 f32 accumulator vectors per lane (at
-// most 16), and the double-buffered staging (2 * (bm + bn) * bk * 2 bytes)
-// within the 96 KiB dynamic shared-memory limit.
+// True when the generator covers the shape. CUDA: bm/16 warps of 32 threads (at
+// most 8 warps, so at most 256 threads), bn/8 f32 accumulator vectors per lane
+// (at most 16), and the double-buffered staging (2 * (bm + bn) * bk * 2 bytes)
+// within the 96 KiB dynamic shared-memory limit. AMDGPU: a whole number of
+// 16x16 WMMA tiles, at most 8 accumulator tiles per lane, and the
+// single-buffered slab within the 64 KiB LDS budget.
 bool dense_gemm_shape_supported(const DenseGemmShape &shape);
 
 // Launch geometry: grid (ceil(N/bn), ceil(M/bm)). CUDA: (bm/16)*32 threads
-// per block; AMDGPU: kAmdDenseGemmThreads (256) -- the scalar body fixes the
-// thread count and derives its per-thread register tile from it.
+// per block. AMDGPU: 4 or 8 warps of 32 threads (128 or 256), one 16x16 WMMA
+// tile per warp slot, so the count follows the tile grid.
 int dense_gemm_block_threads(const DenseGemmShape &shape);
 int dense_gemm_shared_bytes(const DenseGemmShape &shape);
 
@@ -89,7 +94,7 @@ constexpr const char *kDenseGemmKernelEntry = "gemm";
 std::optional<std::string> generate_dense_gemm_ptx(const DenseGemmShape &shape,
                                                    int sm_arch);
 
-// The AMDGPU twin: emit the scalar body and lower it to an HSA code object for
+// The AMDGPU twin: emit the WMMA body and lower it to an HSA code object for
 // `gfx_arch` (1151 = gfx1151). nullopt on a non-ROCm build, an unsupported
 // shape, or any lowering failure.
 std::optional<std::string> generate_dense_gemm_hsaco(const DenseGemmShape &shape,

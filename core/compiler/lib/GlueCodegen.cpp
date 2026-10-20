@@ -1769,6 +1769,8 @@ std::optional<std::string> lower_gpu_module_to_ptx(std::string_view mlir_text,
   if (!module) {
     std::fprintf(stderr, "glue codegen: the %s module did not parse\n",
                  name.c_str());
+    if (const char *d = std::getenv("SONICBOOM_DUMP_BAD_IR"); d && *d)
+      std::fprintf(stderr, "%s\n", std::string(text).c_str());
     return std::nullopt;
   }
 
@@ -1928,6 +1930,8 @@ std::optional<std::string> lower_gpu_module_to_hsaco(std::string_view mlir_text,
   if (!module) {
     std::fprintf(stderr, "glue codegen: the %s module did not parse\n",
                  name.c_str());
+    if (const char *d = std::getenv("SONICBOOM_DUMP_BAD_IR"); d && *d)
+      std::fprintf(stderr, "%s\n", std::string(text).c_str());
     return std::nullopt;
   }
 
