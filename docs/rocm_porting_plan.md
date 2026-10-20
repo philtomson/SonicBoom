@@ -1,9 +1,11 @@
 # ROCm / Strix Halo Porting Plan
 
-Status: **active** — Phase 0-2 complete (branch `amd_dev`), Phase 4 under way
-(vendor-neutral device gate + vendor-neutral device/backend IDs landed; the
-per-op and device-resident forward paths run on AMD), Phase 3 started
-(generated decode and prefill attention and the dense bf16 GEMM run on AMD).
+Status: **functional path complete** (branch `amd_dev`) — Phases 0-4 done: the
+hand-written kernels, the device-resident forward, the planner spine (graph
+capture/replay through the HIP twin) and the generated decode/prefill attention
+and dense bf16 GEMM all run on AMD. What is not closed is verification beyond
+each unit (no GGUF fixture here, so the token-level spine tests skip) and the
+tensor-core optimization (MFMA).
 `origin/master` merged in
 (bb8e43f): upstream's training/backward work is CUDA-gated in its host files,
 so the ROCm build takes it as host-only code; two conflicts (NVTX include,
@@ -333,18 +335,39 @@ skips when no AMD device is present).
       twins), so it is enabled too. Not exercised end-to-end here (no GGUF
       fixture); the kernels themselves are the ones `test_cuda_elementwise` /
       `test_cuda_quant` already cover on this build.
-- [ ] **Spine + planner GPU enumeration (one unit).** `generate()` /
-      `generate_prompt()` keep the CUDA-specific query on purpose: on a ROCm
-      build `generate_spine_cuda` / `generate_prefill_spine_cuda`
-      (`core/src/model/gemma4_plan.cpp:1107`, `:2607`) are the `#else` stubs
-      returning 0, so routing a device into them would silently emit no tokens.
-      `planner/resource.cpp:270` stays CUDA-gated for the same reason: a GPU
-      device in the default snapshot makes plans place work on a backend
-      nothing registers on ROCm. Both flip when the CUDA spine is ported to HIP
-      (capture + NVTX + `SonicCudaBackend`), which is the remaining Phase 4
-      item. `test_generate.cpp:171` / `:269` also stay gated until then: they
-      go through `generate()`, so on ROCm they would exercise the CPU spine and
-      label it "Cuda" (`:171`) or hit the stub (`:269`).
+- [x] **Spine + planner GPU enumeration (one unit).** The spine turned out to
+      be almost entirely backend-neutral already: its graph capture and stream
+      scopes go through `SonicCudaBackend` (`sbstream::GraphStep` /
+      `CaptureScope`, `nn/hip_graph.h` / `hip_stream.h` on ROCm), and every
+      kernel call is a `nn::cuda` / `quant::cuda` twin the HIP build defines.
+      Only three things were CUDA-specific, and none of them needed logic
+      changes:
+      * the two `#ifdef SONICBOOM_USE_CUDA` guards around the decode and
+        prefill spine blocks (`gemma4_plan.cpp:1107`, `:2607`) widened to
+        `#if defined(SONICBOOM_USE_CUDA) || defined(SONICBOOM_USE_ROCM)`; the
+        `#else` stubs now apply only to CPU-only builds;
+      * NVTX — no-op `nvtxRangePushA`/`nvtxRangePop` shims on ROCm (the same
+        choice `planner/sonic_cuda_backend.cpp` already made: the ranges are
+        opt-in nsys markers, and nvtx3 is a CUDA-toolkit header);
+      * `device_identity()` — `hipGetDeviceProperties` twin reporting
+        `"<name> cu <n> <gcnArchName>"` (the CU count is what the split-KV grid
+        sizing reads; there is no cc major/minor on ROCm).
+      The gates then move to the vendor-neutral query: `generate()` /
+      `generate_prompt()` (`core/src/model/exec.cpp`) call
+      `quant::gpu_available()`, and `CpuResourceProvider::snapshot` enumerates
+      the device behind `cfg.enumerate_gpu` (renamed from `enumerate_cuda`;
+      the field is the "this snapshot may place work on a GPU" switch, not a
+      vendor one). The enumerated `Device::name` is `"cuda"` / `"hip"` per
+      build, because it is hashed into the snapshot fingerprint and a ROCm plan
+      must not collide with a CUDA plan.
+      `tests/core/test_planner_resource.cpp` follows the same gate;
+      `tests/core/test_generate.cpp:171` / `:269` now run their device arms on
+      either backend.
+      **Verification limit:** the unit tests validate the pieces (kernels,
+      generated regions, the backend's own capture path), but no GGUF fixture
+      is present here, so the token-level spine tests still skip and the HIP
+      spine has not been run end-to-end. Compile + suite green is the evidence
+      available in this environment.
 - [x] **Vendor-neutral IDs.** `DeviceType::GPU` + `Device::gpu()` (was
       `DeviceType::CUDA` / `Device::cuda()`), `BackendId::gpu()` (was
       `cuda()`), and `SonicCudaBackend`'s header moved from
@@ -354,8 +377,21 @@ skips when no AMD device is present).
       what "GPU" means, and on this build that is still CUDA. `quant::cuda`
       stays as the vendor-specific kernel namespace, paired with the neutral
       `quant::gpu_available()`.
-- [ ] Relax byte-identity attention/GEMM asserts (wave/expf differences) —
-      applies once those regions exist for AMD (Phase 3).
+- [x] **Relax byte-identity asserts where the reference is CUDA-specific.**
+      The generated-region tests never compared against CUDA bytes: the ROCm
+      twins (`test_hip_attention_{decode,prefill}_codegen`,
+      `test_hip_dense_gemm_codegen`) check an fp64 reference with a relative
+      tolerance, plus within-run bitwise properties (determinism, batch
+      invariance, own-vs-generated consistency), and those all pass. The one
+      cross-backend identity assertion is the token stream in `test_generate`:
+      it compares against a llama.cpp **CUDA** golden / the CPU q8_K oracle.
+      Greedy argmax reproduces that stream on CUDA but is not a numeric
+      invariant — ROCm's ocml `expf`, its reduction orders (split-KV atomics)
+      and its generated attention differ in the last bits, any of which can
+      flip a near-tie. So the strict stream identity stays asserted on a CUDA
+      device only; on ROCm the stream is printed ("matches"/"differs") and the
+      structural checks (step count, vocab range, routing) stay hard. Same rule
+      as the prefill-vs-per-token near-tie check that already existed there.
 
 ## Findings worth keeping (Phase 2)
 
@@ -392,10 +428,16 @@ not of this port:
 
 ## Risks
 - LLVM/MLIR rebuild with AMDGPU is the long pole (hours); submodule not expanded.
-- Attention/GEMM codegen is NVIDIA-mma-specific; the functional AMD path is new
-  code, not a flag flip.
+- Attention/GEMM codegen is NVIDIA-mma-specific and stays that way for CUDA;
+  the functional AMD bodies are new code, not a flag flip (Phase 3).
+- The AMD bodies are scalar (f32 accumulation, `vector.reduction`); MFMA is the
+  performance follow-up, so generated dense GEMM throughput is well below
+  rocBLAS. gfx1151's 64 KiB LDS is checked at codegen (the dense body rejects
+  tiles that do not fit); attention uses no LDS on AMD.
 - Wave width / shared-memory / async-copy semantics differ; wave32 is pinned
-  (see Phase 2). LDS limits on gfx1151 still need checking once the generated
-  attention/GEMM regions exist.
+  (see Phase 2).
+- The HIP spine compiles and links but has not been run end-to-end (no model
+  fixture): capture/replay + pooled buffers + the generated decode/prefill
+  regions have only been exercised piecewise.
 - Native-torch HIP sources exist upstream but are `EXCLUDE` in the migration
   manifest; not needed for v0's own kernels.

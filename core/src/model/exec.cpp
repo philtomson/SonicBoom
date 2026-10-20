@@ -563,13 +563,12 @@ uint64_t generate(const Gemma4Model& m, uint64_t start_token, uint64_t start_pos
   // lm_head loop (generate_reference) is oracle-only; it stays reachable for the
   // f32 scalar reference, which has no spine variant.
   //
-  // Unlike the per-op routing above, this gate stays CUDA-specific: on a ROCm
-  // build generate_spine_cuda (and generate_prefill_spine_cuda below) are the
-  // no-device stubs returning 0, so sending a ROCm device here would silently
-  // produce no tokens. The spine's own ROCm port moves this to gpu_available().
+  // The spine is the target's device capture loop: the CUDA block and its HIP
+  // twin (nn/hip_graph.h through SonicCudaBackend) implement the same
+  // contract, so the gate is the vendor-neutral one.
   switch (backend) {
     case quant::MatmulBackend::Cuda:
-      if (quant::cuda_available())
+      if (quant::gpu_available())
         return generate_spine_cuda(m, start_token, start_pos, tokens);
       [[fallthrough]];  // no device: run the CPU spine
     case quant::MatmulBackend::CpuQ8K:
@@ -586,10 +585,10 @@ uint64_t generate_prompt(const Gemma4Model& m, std::span<const uint64_t> prompt,
   // Phase 7 (M4): the prompt path is prefill (batched flash attention) + decode.
   // There is no f32 prefill variant, so CpuF32 degrades to the q8_K CPU prefill
   // (the reference oracle remains generate_reference for single-token decode).
-  // The device gate is CUDA-specific for the same reason as in generate().
+  // The device gate is the same vendor-neutral one as in generate().
   switch (backend) {
     case quant::MatmulBackend::Cuda:
-      if (quant::cuda_available())
+      if (quant::gpu_available())
         return generate_prefill_spine_cuda(m, prompt, start_pos, tokens);
       [[fallthrough]];  // no device: run the CPU prefill
     case quant::MatmulBackend::CpuQ8K:

@@ -167,9 +167,12 @@ int main() {
               << "), " << cpu_tps << " tok/s (seed " << seed << ")\n";
   }
 
-  // --- CUDA (only when a device is actually present) ------------------------
-  if (!sbquant::cuda_available()) {
-    std::cout << "  (skipped: no CUDA device; Cuda backend would fall back to CPU)\n";
+  // --- GPU (only when a device is actually present; CUDA or HIP) ------------
+  // Whether the strict token-identity check below applies: the reference stream
+  // is llama.cpp's CUDA output, and only the CUDA build reproduces it exactly.
+  const bool cuda_reference = sbquant::cuda_available();
+  if (!sbquant::gpu_available()) {
+    std::cout << "  (skipped: no GPU device; Cuda backend would fall back to CPU)\n";
   } else {
     double cuda_tps = 0.0;
     const auto cuda_tokens =
@@ -178,8 +181,19 @@ int main() {
     if (!cpu_tokens.empty()) {
       check(cuda_tokens.size() == cpu_tokens.size(),
             "generate(Cuda): same step count as CPU");
-      check(cuda_tokens == cpu_tokens,
-            "generate(Cuda): token stream identical to CPU q8_K oracle");
+      if (cuda_reference) {
+        check(cuda_tokens == cpu_tokens,
+              "generate(Cuda): token stream identical to CPU q8_K oracle");
+      } else {
+        // The strict identity is a CUDA property: the q8_1 device gemv, the
+        // attention softmax (ocml expf rather than libdevice's) and the
+        // split-KV atomic reduction order all differ slightly on ROCm, which
+        // can flip a greedy argmax at a near-tie. Structural checks above stay
+        // hard; the stream is reported so a divergence is visible.
+        std::cout << "  [hip]      token stream "
+                  << (cuda_tokens == cpu_tokens ? "matches" : "differs from")
+                  << " the CPU q8_K oracle (not asserted: ROCm numerics)\n";
+      }
     }
 
     std::cout << "  [cuda]     " << cuda_tokens.size() << " tokens, "
@@ -265,9 +279,9 @@ int main() {
               << ") over a " << pn << "-token prompt\n";
   }
 
-  // --- spine (CUDA): the Phase 6 fused decode path on device ----------------
-  if (!sbquant::cuda_available()) {
-    std::cout << "  (skipped: no CUDA device; Cuda spine would not run on device)\n";
+  // --- spine (GPU): the Phase 6 fused decode path on device -----------------
+  if (!sbquant::gpu_available()) {
+    std::cout << "  (skipped: no GPU device; Cuda spine would not run on device)\n";
   } else {
     double spine_cuda_tps = 0.0;
     std::vector<int64_t> warmup(1, -1);
@@ -293,9 +307,15 @@ int main() {
     for (int64_t t : spine_cuda_tokens)
       if (t < 0 || uint64_t(t) >= vocab) valid = false;
     check(valid, "generate_spine_cuda: all tokens in vocab range");
-    if (seed == 2 && steps == kGolden.size())
-      check(spine_cuda_tokens == kGolden,
-            "generate_spine_cuda: token stream matches llama.cpp golden");
+    if (seed == 2 && steps == kGolden.size()) {
+      if (cuda_reference) {
+        check(spine_cuda_tokens == kGolden,
+              "generate_spine_cuda: token stream matches llama.cpp golden");
+      } else if (spine_cuda_tokens != kGolden) {
+        std::cout << "  [spine]    token stream differs from the llama.cpp CUDA "
+                     "golden (ROCm numerics; not asserted)\n";
+      }
+    }
 
     // M4: the public generate() routes to the CUDA spine when a device is present.
     {

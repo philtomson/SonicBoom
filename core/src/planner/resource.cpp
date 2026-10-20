@@ -261,20 +261,28 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
 
   // M3: enumerate a CUDA device + device-local memory space when one is present
   // and the caller has not requested a host-only snapshot (a CPU-only spine sets
-  // cfg.enumerate_cuda = false). The GPU device declares exactly the transformer
+  // cfg.enumerate_gpu = false). The GPU device declares exactly the transformer
   // ops the SonicCudaBackend can execute (everything except Softcap, which has
   // no *_dev kernel and stays on the CPU SonicBackend for the sampling path;
   // the greedy decode path never emits Softcap). Embedding and Argmax have *_dev
   // kernels (Phase 3.2), so they run on the GPU and drop the per-token embedding
   // H2D uploads and the 1 MiB logits D2H.
-  if (cfg.enumerate_cuda && quant::cuda_available()) {
+  if (cfg.enumerate_gpu && quant::gpu_available()) {
     Device gpu;
     gpu.id = DeviceId{1};
     gpu.kind = DeviceKind::GPU;
+    // The name is part of the snapshot fingerprint, so keep it backend-specific:
+    // a ROCm plan must not collide with a CUDA plan (different kernels, costs).
+#if defined(SONICBOOM_USE_CUDA)
     gpu.name = "cuda";
+#elif defined(SONICBOOM_USE_ROCM)
+    gpu.name = "hip";
+#else
+    gpu.name = "gpu";
+#endif
     gpu.capability.can_execute = true;
     gpu.capability.supports_async = false;           // default-stream serial
-    gpu.capability.supports_concurrent_copy = false; // synchronous cudaMemcpy
+    gpu.capability.supports_concurrent_copy = false; // synchronous default-stream copy
     gpu.capability.supported_ops = {
         OpKind::Scale,          OpKind::RmsNorm,    OpKind::RmsNormHeads,
         OpKind::Rope,           OpKind::CastFp16,   OpKind::Attention,

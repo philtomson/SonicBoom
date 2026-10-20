@@ -35,9 +35,18 @@
 #include "../planner/autotune.h"  // B7 draft-length cost cache
 #include "mlir/IR/BuiltinTypes.h"
 
-#ifdef SONICBOOM_USE_CUDA
+#if defined(SONICBOOM_USE_CUDA)
 #include <cuda_runtime.h>  // cudaGetDeviceProperties (record device line)
 #include <nvtx3/nvToolsExt.h>  // header-only NVTX (no libnvtx link)
+#elif defined(SONICBOOM_USE_ROCM)
+#include <hip/hip_runtime.h>  // hipGetDeviceProperties (record device line)
+// No NVTX on the AMD path (same reasoning as planner/sonic_cuda_backend.cpp):
+// the ranges are opt-in nsys markers, so they are no-ops here instead of a
+// toolkit dependency.
+inline void nvtxRangePushA(const char*) {}
+inline void nvtxRangePop() {}
+#endif
+#if defined(SONICBOOM_USE_CUDA) || defined(SONICBOOM_USE_ROCM)
 #include <sonicboom/quant/quantized_matmul_cuda.h>
 #endif
 
@@ -64,7 +73,7 @@ namespace sonicboom::model {
 
 namespace {
 
-#ifdef SONICBOOM_USE_CUDA
+#if defined(SONICBOOM_USE_CUDA) || defined(SONICBOOM_USE_ROCM)
 // NVTX step markers are opt-in (see SonicCudaBackend::nvtx_enabled for why):
 // they perturb host timing and shift the split-K gemv's non-deterministic
 // atomicAdd order, so they stay OFF for normal runs and ON only when
@@ -856,10 +865,10 @@ uint64_t generate_spine(const Gemma4Model& m, uint64_t start_token,
 
   planner::Graph graph = build_gemma4_graph(m, /*greedy=*/false);
 
-  // CPU-only spine: enumerate_cuda = false keeps the snapshot host-only so the
+  // CPU-only spine: enumerate_gpu = false keeps the snapshot host-only so the
   // planner places every Sonic node on the CPU and the transfer scheduler emits
   // no H2D/D2H tasks. The SonicBackend then reads/writes host bytes directly.
-  auto snap = planner::CpuResourceProvider::snapshot({.enumerate_cuda = false});
+  auto snap = planner::CpuResourceProvider::snapshot({.enumerate_gpu = false});
   if (!snap) return 0;
   planner::AnalyticalCpuCostModel cost(*snap);
   auto plan = planner::plan_execution(graph, *snap, cost);
@@ -919,7 +928,7 @@ uint64_t generate_prefill_spine(const Gemma4Model& m,
   if (n_ctx == 0) n_ctx = start_pos + prompt.size() + tokens.size();
 
   planner::Graph graph = build_gemma4_graph(m, /*greedy=*/false);
-  auto snap = planner::CpuResourceProvider::snapshot({.enumerate_cuda = false});
+  auto snap = planner::CpuResourceProvider::snapshot({.enumerate_gpu = false});
   if (!snap) return 0;
   planner::AnalyticalCpuCostModel cost(*snap);
   auto plan = planner::plan_execution(graph, *snap, cost);
@@ -1104,7 +1113,7 @@ void spec_counters_reset() { g_spec_counters = SpecCounters{}; }
 // default for Sonic and overrides host-memory-space compute tasks back to the
 // CPU SonicBackend. Greedy argmax is identical to generate_spine.
 // ---------------------------------------------------------------------------
-#ifdef SONICBOOM_USE_CUDA
+#if defined(SONICBOOM_USE_CUDA) || defined(SONICBOOM_USE_ROCM)
 
 // ---------------------------------------------------------------------------
 // Persistent CUDA spine decode runtime (Section C.2). The greedy decode
@@ -2413,9 +2422,10 @@ const char* arch_name(ModelArch a) {
 // The device a record was taken on, for the record's `device` line. Part of the
 // record is device-dependent (the decode-attention split-KV grid is sized from
 // the SM count), so a stored record has to carry which GPU produced it. Queried
-// here because this is the translation unit that owns the CUDA context.
+// here because this is the translation unit that owns the device context.
 std::string device_identity() {
   int dev = 0;
+#if defined(SONICBOOM_USE_CUDA)
   cudaDeviceProp p{};
   if (cudaGetDevice(&dev) != cudaSuccess ||
       cudaGetDeviceProperties(&p, dev) != cudaSuccess)
@@ -2423,6 +2433,17 @@ std::string device_identity() {
   char buf[288];
   std::snprintf(buf, sizeof buf, "%s sm %d cc %d.%d", p.name,
                 p.multiProcessorCount, p.major, p.minor);
+#else
+  hipDeviceProp_t p{};
+  if (hipGetDevice(&dev) != hipSuccess ||
+      hipGetDeviceProperties(&p, dev) != hipSuccess)
+    return "unknown";
+  // ROCm reports the target as a gfx arch name rather than cc major/minor; the
+  // SM count is the CU's, which is what the split-KV grid sizing wants.
+  char buf[288];
+  std::snprintf(buf, sizeof buf, "%s cu %d %s", p.name, p.multiProcessorCount,
+                p.gcnArchName);
+#endif
   return buf;
 }
 
@@ -2604,7 +2625,7 @@ std::string cuda_device_identity() { return "unknown"; }
 // decode runs through the CUDA spine loop. lm_head uses the CUDA backend so the
 // first-token logits match the device spine's lm-head arithmetic.
 // ---------------------------------------------------------------------------
-#ifdef SONICBOOM_USE_CUDA
+#if defined(SONICBOOM_USE_CUDA) || defined(SONICBOOM_USE_ROCM)
 // Env-gated logit dump (C.4 isolation measurement). When SONICBOOM_DUMP_LOGITS
 // is set, the decode graph is built non-greedy (Softcap output) so each step's
 // softcapped logits reach the host, and the top-2 (with their logits) are
